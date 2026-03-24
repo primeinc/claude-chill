@@ -168,4 +168,48 @@ mod tests {
         tracker.process(b"\x1b[<u");
         assert!(!tracker.mode_enabled());
     }
+
+    #[test]
+    fn test_kitty_set_enables_when_stack_empty() {
+        let mut tracker = KittyTracker::new(true, 0);
+        // CSI = 1 u = set with flags (non-empty)
+        tracker.process(b"\x1b[=1u");
+        assert_eq!(tracker.stack, 1);
+        assert!(tracker.mode_enabled());
+    }
+
+    #[test]
+    fn test_kitty_set_noop_when_already_pushed() {
+        let mut tracker = KittyTracker::new(true, 0);
+        tracker.process(b"\x1b[>1u"); // push
+        assert_eq!(tracker.stack, 1);
+        // Set with flags when already in mode — should not change stack
+        tracker.process(b"\x1b[=1u");
+        assert_eq!(tracker.stack, 1);
+    }
+
+    #[test]
+    fn test_kitty_initial_stack() {
+        let tracker = KittyTracker::new(true, 2);
+        assert!(tracker.mode_enabled());
+        assert_eq!(tracker.stack, 2);
+    }
+
+    #[test]
+    fn test_kitty_unsupported_ignores_everything() {
+        let mut tracker = KittyTracker::new(false, 0);
+        tracker.process(b"\x1b[>1u"); // push
+        tracker.process(b"\x1b[=1u"); // set
+        assert_eq!(tracker.stack, 0);
+        assert!(!tracker.mode_enabled());
+    }
+
+    #[test]
+    fn test_kitty_pop_without_push() {
+        let mut tracker = KittyTracker::new(true, 0);
+        // Pop with nothing on stack — should stay at 0
+        tracker.process(b"\x1b[<u");
+        assert_eq!(tracker.stack, 0);
+        assert!(!tracker.mode_enabled());
+    }
 }
