@@ -5,7 +5,7 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/index");
 
     let git_hash = get_git_hash();
-    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
 }
 
 fn get_git_hash() -> String {
@@ -31,7 +31,7 @@ fn get_git_hash() -> String {
         .unwrap_or(false);
 
     if is_dirty {
-        format!("{}-dirty", hash)
+        format!("{hash}-dirty")
     } else {
         hash
     }

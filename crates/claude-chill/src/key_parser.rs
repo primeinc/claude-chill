@@ -79,9 +79,9 @@ impl KeyCombination {
             + if self.modifiers.ctrl { 4 } else { 0 };
 
         if modifier == 1 {
-            Some(format!("\x1b[{}u", codepoint).into_bytes())
+            Some(format!("\x1b[{codepoint}u").into_bytes())
         } else {
-            Some(format!("\x1b[{};{}u", codepoint, modifier).into_bytes())
+            Some(format!("\x1b[{codepoint};{modifier}u").into_bytes())
         }
     }
 }
@@ -98,8 +98,8 @@ impl fmt::Display for KeyCombination {
             write!(f, "[alt]")?;
         }
         let key_name = match &self.code {
-            KeyCode::Char(c) => format!("[{}]", c),
-            KeyCode::F(n) => format!("[f{}]", n),
+            KeyCode::Char(c) => format!("[{c}]"),
+            KeyCode::F(n) => format!("[f{n}]"),
             KeyCode::Enter => "[enter]".to_string(),
             KeyCode::Esc => "[esc]".to_string(),
             KeyCode::Tab => "[tab]".to_string(),
@@ -116,7 +116,7 @@ impl fmt::Display for KeyCombination {
             KeyCode::Right => "[right]".to_string(),
             KeyCode::Space => "[space]".to_string(),
         };
-        write!(f, "{}", key_name)
+        write!(f, "{key_name}")
     }
 }
 
@@ -132,7 +132,7 @@ pub fn parse(raw: &str) -> Result<KeyCombination, ParseKeyError> {
         if chars[i] != '[' {
             return Err(ParseKeyError::new(
                 raw,
-                format!("expected '[' at position {}", i),
+                format!("expected '[' at position {i}"),
             ));
         }
 
@@ -200,7 +200,7 @@ fn parse_key_code(token: &str, raw: &str) -> Result<KeyCode, ParseKeyError> {
         "f11" => KeyCode::F(11),
         "f12" => KeyCode::F(12),
         s if s.len() == 1 => KeyCode::Char(s.chars().next().unwrap_or(' ')),
-        _ => return Err(ParseKeyError::new(raw, format!("unknown key: {}", token))),
+        _ => return Err(ParseKeyError::new(raw, format!("unknown key: {token}"))),
     };
     Ok(code)
 }
@@ -218,14 +218,14 @@ fn key_to_escape_sequence(code: &KeyCode, modifiers: &Modifiers) -> Vec<u8> {
             if modifier_code == 0 {
                 b"\x1b[H".to_vec()
             } else {
-                format!("\x1b[1;{}H", modifier_code).into_bytes()
+                format!("\x1b[1;{modifier_code}H").into_bytes()
             }
         }
         KeyCode::End => {
             if modifier_code == 0 {
                 b"\x1b[F".to_vec()
             } else {
-                format!("\x1b[1;{}F", modifier_code).into_bytes()
+                format!("\x1b[1;{modifier_code}F").into_bytes()
             }
         }
         KeyCode::Up => arrow_key(b'A', modifier_code),
@@ -342,9 +342,9 @@ fn function_key(n: u8, modifier: u8) -> Vec<u8> {
     };
 
     if modifier == 0 {
-        format!("\x1b[{}~", code).into_bytes()
+        format!("\x1b[{code}~").into_bytes()
     } else {
-        format!("\x1b[{};{}~", code, modifier).into_bytes()
+        format!("\x1b[{code};{modifier}~").into_bytes()
     }
 }
 

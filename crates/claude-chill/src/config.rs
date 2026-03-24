@@ -4,7 +4,6 @@ use std::fs;
 use std::path::PathBuf;
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
-const DEFAULT_REFRESH_RATE: u64 = 20;
 const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 15000;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12,7 +11,6 @@ const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 15000;
 pub struct Config {
     pub history_lines: usize,
     pub lookback_key: String,
-    pub refresh_rate: u64,
     pub auto_lookback_timeout_ms: u64,
 }
 
@@ -21,7 +19,6 @@ impl Default for Config {
         Self {
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
-            refresh_rate: DEFAULT_REFRESH_RATE,
             auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
         }
     }
@@ -67,26 +64,6 @@ impl Config {
     pub fn parse_lookback_key(&self) -> Result<KeyCombination, key_parser::ParseKeyError> {
         key_parser::parse(&self.lookback_key)
     }
-
-    pub fn lookback_sequence(&self) -> Vec<u8> {
-        self.parse_lookback_key()
-            .map(|k| k.to_escape_sequence())
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "Warning: Invalid lookback_key '{}': {}",
-                    self.lookback_key, e
-                );
-                eprintln!("Using default: {}", DEFAULT_LOOKBACK_KEY);
-                key_parser::parse(DEFAULT_LOOKBACK_KEY)
-                    .map(|k| k.to_escape_sequence())
-                    .unwrap_or_else(|_| b"\x1b[5;6~".to_vec())
-            })
-    }
-
-    pub fn redraw_throttle_ms(&self) -> u64 {
-        let rate = self.refresh_rate.max(1);
-        1000 / rate
-    }
 }
 
 #[cfg(test)]
@@ -98,14 +75,13 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.history_lines, 100_000);
         assert_eq!(config.lookback_key, "[ctrl][6]");
-        assert_eq!(config.refresh_rate, 20);
-        assert_eq!(config.redraw_throttle_ms(), 50);
         assert_eq!(config.auto_lookback_timeout_ms, 15000);
     }
 
     #[test]
-    fn test_default_lookback_sequence() {
+    fn test_default_lookback_key_parses() {
         let config = Config::default();
-        assert_eq!(config.lookback_sequence(), vec![0x1E]);
+        let key = config.parse_lookback_key().unwrap();
+        assert_eq!(key.to_escape_sequence(), vec![0x1E]);
     }
 }

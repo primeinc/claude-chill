@@ -42,15 +42,14 @@ fn main() -> ExitCode {
             (legacy, kitty)
         }
         Err(e) => {
-            eprintln!("Invalid lookback key '{}': {}", lookback_key, e);
+            eprintln!("Invalid lookback key '{lookback_key}': {e}");
             eprintln!("Using default: [ctrl][6]");
             (vec![0x1E], b"\x1b[54;5u".to_vec())
         }
     };
 
     debug!(
-        "Lookback sequences: legacy={:?} kitty={:?}",
-        lookback_sequence_legacy, lookback_sequence_kitty
+        "Lookback sequences: legacy={lookback_sequence_legacy:?} kitty={lookback_sequence_kitty:?}"
     );
 
     let auto_lookback_timeout_ms = cli
@@ -71,12 +70,12 @@ fn main() -> ExitCode {
         Ok(mut proxy) => match proxy.run() {
             Ok(exit_code) => ExitCode::from(exit_code as u8),
             Err(e) => {
-                eprintln!("Proxy error: {}", e);
+                eprintln!("Proxy error: {e}");
                 ExitCode::from(1)
             }
         },
         Err(e) => {
-            eprintln!("Failed to start proxy: {:#}", e);
+            eprintln!("Failed to start proxy: {e:#}");
             ExitCode::from(1)
         }
     }

@@ -38,7 +38,7 @@ impl HistoryFilter {
         for action in actions {
             if is_safe_for_history(&action) {
                 // Re-encode the action
-                let _ = write!(output, "{}", action);
+                let _ = write!(output, "{action}");
             }
         }
 

@@ -1,8 +1,10 @@
+pub mod alt_screen;
 pub mod config;
 pub mod escape_filter;
 pub mod escape_sequences;
 pub mod history_filter;
 pub mod key_parser;
+pub mod kitty_tracker;
 pub mod line_buffer;
 pub mod proxy;
-pub mod redraw_throttler;
+pub mod sync_block;
