@@ -371,25 +371,33 @@ impl Proxy {
         self.vt_render_pending = true;
         self.last_output_time = Some(Instant::now());
 
-        // Check for alt screen enter before sync parsing
+        // Process sync blocks for history management, watching for alt screen enter
         if let Some(alt_pos) = self.alt_screen.find_enter(data) {
             debug!("process_output: ALT_SCREEN_ENTER detected at pos={alt_pos}");
-            // Add ALL remaining data to history (including alt screen enter and content)
-            // This ensures history matches VT exactly
+            // Parse sync blocks in data up to the alt screen enter point,
+            // then flush any remaining sync block state with the rest
+            let before_alt = &data[..alt_pos];
+            if !before_alt.is_empty() {
+                let mut segments = Vec::new();
+                self.sync_parser.parse(before_alt, &mut segments);
+                for segment in segments {
+                    self.apply_segment_to_history(segment);
+                }
+            }
+            // Flush any open sync block with remaining data
+            let remaining = &data[alt_pos..];
             if self.sync_parser.in_sync_block() {
-                let segment = self.sync_parser.append_and_flush(data);
+                let segment = self.sync_parser.append_and_flush(remaining);
                 self.apply_segment_to_history(segment);
             } else {
-                self.push_to_history(data);
+                self.push_to_history(remaining);
             }
             self.alt_screen.set_alternate_screen(true);
             let seq_len = self.alt_screen.enter_len(&data[alt_pos..]);
-            // Write alt screen enter directly
             self.write_to_terminal(stdout_fd, &data[alt_pos..alt_pos + seq_len])?;
             return self.process_output_alt_screen(&data[alt_pos + seq_len..], stdout_fd);
         }
 
-        // Process sync blocks for history management
         let mut segments = Vec::new();
         self.sync_parser.parse(data, &mut segments);
         for segment in segments {

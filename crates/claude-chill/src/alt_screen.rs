@@ -152,4 +152,55 @@ mod tests {
         tracker.set_alternate_screen(false);
         assert!(!tracker.in_alternate_screen());
     }
+
+    #[test]
+    fn test_find_enter_both_modern_and_legacy_picks_earliest() {
+        let tracker = AltScreenTracker::new();
+        // Legacy comes first
+        let mut data = Vec::new();
+        data.extend_from_slice(ALT_SCREEN_ENTER_LEGACY);
+        data.extend_from_slice(b"gap");
+        data.extend_from_slice(ALT_SCREEN_ENTER);
+        assert_eq!(tracker.find_enter(&data), Some(0));
+
+        // Modern comes first
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(ALT_SCREEN_ENTER);
+        data2.extend_from_slice(b"gap");
+        data2.extend_from_slice(ALT_SCREEN_ENTER_LEGACY);
+        assert_eq!(tracker.find_enter(&data2), Some(0));
+    }
+
+    #[test]
+    fn test_find_exit_both_modern_and_legacy_picks_earliest() {
+        let tracker = AltScreenTracker::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"prefix");
+        data.extend_from_slice(ALT_SCREEN_EXIT_LEGACY);
+        data.extend_from_slice(b"gap");
+        data.extend_from_slice(ALT_SCREEN_EXIT);
+        assert_eq!(tracker.find_exit(&data), Some(6));
+    }
+
+    #[test]
+    fn test_find_on_empty_data() {
+        let tracker = AltScreenTracker::new();
+        assert_eq!(tracker.find_enter(b""), None);
+        assert_eq!(tracker.find_exit(b""), None);
+    }
+
+    #[test]
+    fn test_exit_len_modern() {
+        let tracker = AltScreenTracker::new();
+        assert_eq!(tracker.exit_len(ALT_SCREEN_EXIT), ALT_SCREEN_EXIT.len());
+    }
+
+    #[test]
+    fn test_exit_len_legacy() {
+        let tracker = AltScreenTracker::new();
+        assert_eq!(
+            tracker.exit_len(ALT_SCREEN_EXIT_LEGACY),
+            ALT_SCREEN_EXIT_LEGACY.len()
+        );
+    }
 }
