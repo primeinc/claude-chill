@@ -862,4 +862,36 @@ mod tests {
         assert_eq!(output1, b"before".to_vec());
         assert_eq!(output2, b"after".to_vec());
     }
+
+    #[test]
+    fn test_split_dcs_across_three_chunks() {
+        let mut filter = TerminalQueryFilter::new();
+        // ESC P $ q m ESC \ split across 3 chunks
+        let output1 = filter.filter(b"before\x1b");
+        let output2 = filter.filter(b"P$q");
+        let output3 = filter.filter(b"m\x1b\\after");
+        assert_eq!(output1, b"before".to_vec());
+        assert_eq!(output2, b"".to_vec());
+        assert_eq!(output3, b"after".to_vec());
+    }
+
+    #[test]
+    fn test_split_osc_across_three_chunks() {
+        let mut filter = TerminalQueryFilter::new();
+        // ESC ] 11 ; ? BEL split across 3 chunks
+        let output1 = filter.filter(b"before\x1b");
+        let output2 = filter.filter(b"]11");
+        let output3 = filter.filter(b";?\x07after");
+        assert_eq!(output1, b"before".to_vec());
+        assert_eq!(output2, b"".to_vec());
+        assert_eq!(output3, b"after".to_vec());
+    }
+
+    #[test]
+    fn test_interleaved_query_and_normal() {
+        let mut filter = TerminalQueryFilter::new();
+        // Normal text, query, more normal text, another query
+        let output = filter.filter(b"hello\x1b[c world\x1b[6n end");
+        assert_eq!(output, b"hello world end".to_vec());
+    }
 }
