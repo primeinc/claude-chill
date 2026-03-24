@@ -114,8 +114,6 @@ impl SyncBlockParser {
         );
 
         let data = std::mem::take(&mut self.sync_buffer);
-        // Re-allocate for next sync block
-        self.sync_buffer = Vec::with_capacity(SYNC_BUFFER_CAPACITY);
 
         OutputSegment::SyncBlock {
             data,
