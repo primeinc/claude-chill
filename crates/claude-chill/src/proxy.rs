@@ -1002,4 +1002,38 @@ mod tests {
             SequenceMatch::Complete
         );
     }
+
+    #[test]
+    fn test_sequence_match_long_buffer_overflow() {
+        // Buffer longer than sequence — should window correctly
+        let sequence = &[0x1E]; // 1 byte
+        // Buffer has 10 bytes of junk
+        assert_eq!(
+            check_sequence_match(b"0123456789", 0x1E, sequence),
+            SequenceMatch::Complete
+        );
+    }
+
+    #[test]
+    fn test_sequence_match_multi_byte_with_noise_prefix() {
+        // Buffer full of noise, then correct sequence bytes arrive
+        let sequence = b"\x1b[54;5u"; // 7 bytes
+        // Buffer has the first 6 bytes correctly after windowing
+        let buffer = b"\x1b[54;5";
+        assert_eq!(
+            check_sequence_match(buffer, b'u', sequence),
+            SequenceMatch::Complete
+        );
+    }
+
+    #[test]
+    fn test_sequence_match_almost_match() {
+        // Buffer has almost the right prefix but wrong final byte
+        let sequence = b"\x1b[54;5u";
+        let buffer = b"\x1b[54;5";
+        assert_eq!(
+            check_sequence_match(buffer, b'x', sequence),
+            SequenceMatch::None
+        );
+    }
 }

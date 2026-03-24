@@ -12,6 +12,9 @@ pub struct Config {
     pub history_lines: usize,
     pub lookback_key: String,
     pub auto_lookback_timeout_ms: u64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    refresh_rate: Option<u64>,
 }
 
 impl Default for Config {
@@ -20,6 +23,7 @@ impl Default for Config {
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
             auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
+            refresh_rate: None,
         }
     }
 }
@@ -83,5 +87,32 @@ mod tests {
         let config = Config::default();
         let key = config.parse_lookback_key().unwrap();
         assert_eq!(key.to_escape_sequence(), vec![0x1E]);
+    }
+
+    #[test]
+    fn test_backward_compat_refresh_rate() {
+        // Old config files may have refresh_rate — should not break parsing
+        let toml_str = r#"
+            history_lines = 50000
+            lookback_key = "[f12]"
+            refresh_rate = 20
+            auto_lookback_timeout_ms = 30000
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.history_lines, 50000);
+        assert_eq!(config.lookback_key, "[f12]");
+        assert_eq!(config.auto_lookback_timeout_ms, 30000);
+    }
+
+    #[test]
+    fn test_config_without_refresh_rate() {
+        // New config files without refresh_rate should also work
+        let toml_str = r#"
+            history_lines = 75000
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.history_lines, 75000);
+        assert_eq!(config.lookback_key, "[ctrl][6]");
+        assert_eq!(config.auto_lookback_timeout_ms, 15000);
     }
 }

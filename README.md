@@ -119,7 +119,6 @@ Config file location:
 ```toml
 history_lines = 100000           # Max lines stored for lookback
 lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
-refresh_rate = 20                # Rendering FPS
 auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
 ```
 
