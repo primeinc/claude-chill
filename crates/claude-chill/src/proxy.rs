@@ -5,6 +5,7 @@ use crate::escape_sequences::{
 use crate::history_filter::HistoryFilter;
 use crate::kitty_tracker::KittyTracker;
 use crate::line_buffer::LineBuffer;
+use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::{OutputSegment, SyncBlockParser};
 use anyhow::{Context, Result};
 use log::debug;
@@ -21,20 +22,10 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use termwiz::escape::Action;
-use termwiz::escape::csi::{CSI, Keyboard};
-use termwiz::escape::parser::Parser as TermwizParser;
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SequenceMatch {
-    Complete,
-    Partial,
-    None,
-}
 
 extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
@@ -95,10 +86,19 @@ pub struct Proxy {
     output_buffer: Vec<u8>,
 }
 
+/// Detect Kitty keyboard protocol support and return a configured KittyTracker.
+fn detect_kitty_support() -> KittyTracker {
+    let (supported, initial_flags) = query_kitty_support();
+    let initial_stack = if initial_flags > 0 { 1 } else { 0 };
+    KittyTracker::new(supported, initial_stack)
+}
+
 /// Returns (supported, initial_flags) - if flags > 0, terminal is already in Kitty mode
-fn detect_kitty_support() -> (bool, u32) {
+fn query_kitty_support() -> (bool, u32) {
     use std::io::Write;
-    use termwiz::escape::csi::Device;
+    use termwiz::escape::Action;
+    use termwiz::escape::csi::{CSI, Device, Keyboard};
+    use termwiz::escape::parser::Parser as TermwizParser;
 
     // Query sequences:
     // CSI ? u       - Kitty keyboard protocol query
@@ -182,9 +182,7 @@ impl Proxy {
         setup_signal_handlers()?;
 
         // Detect Kitty support before spawning child
-        // If flags > 0, terminal is already in Kitty mode (inherited from parent)
-        let (kitty_supported, kitty_initial_flags) = detect_kitty_support();
-        let kitty_initial_stack = if kitty_initial_flags > 0 { 1 } else { 0 };
+        let kitty_tracker = detect_kitty_support();
 
         let slave_fd = pty.slave.as_raw_fd();
 
@@ -247,7 +245,7 @@ impl Proxy {
             sync_parser: SyncBlockParser::new(),
             in_lookback_mode: false,
             alt_screen: AltScreenTracker::new(),
-            kitty_tracker: KittyTracker::new(kitty_supported, kitty_initial_stack),
+            kitty_tracker,
             vt_render_pending: false,
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
@@ -652,7 +650,7 @@ impl Proxy {
             }
 
             let lookback_action =
-                check_sequence_match(&self.lookback_input_buffer, byte, &lookback_sequence);
+                sequence_match::check(&self.lookback_input_buffer, byte, &lookback_sequence);
 
             self.lookback_input_buffer.push(byte);
             if self.lookback_input_buffer.len() > lookback_sequence.len() {
@@ -819,37 +817,6 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     }
 }
 
-/// Check if appending `byte` to `buffer` would match `sequence`.
-/// Does not mutate `buffer` — the caller is responsible for updating it.
-fn check_sequence_match(buffer: &[u8], byte: u8, sequence: &[u8]) -> SequenceMatch {
-    // Build a temporary view: the tail of buffer + new byte, windowed to sequence length
-    let buf_start = if buffer.len() + 1 > sequence.len() {
-        buffer.len() + 1 - sequence.len()
-    } else {
-        0
-    };
-    let prefix = &buffer[buf_start..];
-
-    // Check if prefix + byte matches the full sequence
-    if prefix.len() + 1 == sequence.len()
-        && sequence[..prefix.len()] == *prefix
-        && sequence[prefix.len()] == byte
-    {
-        SequenceMatch::Complete
-    } else {
-        // Check partial: does prefix + byte form a prefix of the sequence?
-        let candidate_len = prefix.len() + 1;
-        if candidate_len <= sequence.len()
-            && sequence[..prefix.len()] == *prefix
-            && sequence[prefix.len()] == byte
-        {
-            SequenceMatch::Partial
-        } else {
-            SequenceMatch::None
-        }
-    }
-}
-
 fn setup_raw_mode() -> Result<Option<Termios>> {
     let stdin = io::stdin();
     if !isatty(&stdin).unwrap_or(false) {
@@ -902,138 +869,4 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
 
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sequence_match_complete_single_byte() {
-        let sequence = &[0x1E];
-        assert_eq!(
-            check_sequence_match(&[], 0x1E, sequence),
-            SequenceMatch::Complete
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_complete_multi_byte() {
-        let sequence = b"\x1b[54;5u";
-        let mut buffer = Vec::new();
-        for &byte in &sequence[..sequence.len() - 1] {
-            let result = check_sequence_match(&buffer, byte, sequence);
-            assert_eq!(result, SequenceMatch::Partial);
-            buffer.push(byte);
-            if buffer.len() > sequence.len() {
-                buffer.drain(..buffer.len() - sequence.len());
-            }
-        }
-        assert_eq!(
-            check_sequence_match(&buffer, sequence[sequence.len() - 1], sequence),
-            SequenceMatch::Complete
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_partial() {
-        let sequence = b"\x1b[54;5u";
-        assert_eq!(
-            check_sequence_match(&[], 0x1b, sequence),
-            SequenceMatch::Partial
-        );
-        assert_eq!(
-            check_sequence_match(&[0x1b], b'[', sequence),
-            SequenceMatch::Partial
-        );
-        assert_eq!(
-            check_sequence_match(&[0x1b, b'['], b'5', sequence),
-            SequenceMatch::Partial
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_none_wrong_byte() {
-        let sequence = b"\x1b[54;5u";
-        assert_eq!(
-            check_sequence_match(&[], b'a', sequence),
-            SequenceMatch::None
-        );
-        assert_eq!(
-            check_sequence_match(&[0x1b], b'O', sequence),
-            SequenceMatch::None
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_buffer_rolling() {
-        let sequence = b"\x1b[54;5u";
-        assert_eq!(
-            check_sequence_match(&[], b'a', sequence),
-            SequenceMatch::None
-        );
-        assert_eq!(
-            check_sequence_match(b"a", b'b', sequence),
-            SequenceMatch::None
-        );
-        assert_eq!(
-            check_sequence_match(b"ab", 0x1b, sequence),
-            SequenceMatch::None
-        );
-        assert_eq!(
-            check_sequence_match(&[], 0x1b, sequence),
-            SequenceMatch::Partial
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_interleaved_typing() {
-        let sequence = &[0x1E];
-        assert_eq!(
-            check_sequence_match(&[], b'a', sequence),
-            SequenceMatch::None
-        );
-        assert_eq!(
-            check_sequence_match(b"a", b'b', sequence),
-            SequenceMatch::None
-        );
-        assert_eq!(
-            check_sequence_match(b"ab", 0x1E, sequence),
-            SequenceMatch::Complete
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_long_buffer_overflow() {
-        // Buffer longer than sequence — should window correctly
-        let sequence = &[0x1E]; // 1 byte
-        // Buffer has 10 bytes of junk
-        assert_eq!(
-            check_sequence_match(b"0123456789", 0x1E, sequence),
-            SequenceMatch::Complete
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_multi_byte_with_noise_prefix() {
-        // Buffer full of noise, then correct sequence bytes arrive
-        let sequence = b"\x1b[54;5u"; // 7 bytes
-        // Buffer has the first 6 bytes correctly after windowing
-        let buffer = b"\x1b[54;5";
-        assert_eq!(
-            check_sequence_match(buffer, b'u', sequence),
-            SequenceMatch::Complete
-        );
-    }
-
-    #[test]
-    fn test_sequence_match_almost_match() {
-        // Buffer has almost the right prefix but wrong final byte
-        let sequence = b"\x1b[54;5u";
-        let buffer = b"\x1b[54;5";
-        assert_eq!(
-            check_sequence_match(buffer, b'x', sequence),
-            SequenceMatch::None
-        );
-    }
 }

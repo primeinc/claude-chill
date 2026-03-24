@@ -7,4 +7,5 @@ pub mod key_parser;
 pub mod kitty_tracker;
 pub mod line_buffer;
 pub mod proxy;
+pub mod sequence_match;
 pub mod sync_block;
