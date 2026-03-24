@@ -228,4 +228,114 @@ mod tests {
         parser.reset();
         assert!(!parser.in_sync_block());
     }
+
+    #[test]
+    fn test_multiple_sync_blocks_in_one_chunk() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"block1");
+        input.extend_from_slice(SYNC_END);
+        input.extend_from_slice(b"gap");
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"block2");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 3);
+
+        match &segments[0] {
+            OutputSegment::SyncBlock { is_full_redraw, .. } => assert!(!is_full_redraw),
+            _ => panic!("expected SyncBlock"),
+        }
+        match &segments[1] {
+            OutputSegment::PassThrough(data) => assert_eq!(*data, b"gap"),
+            _ => panic!("expected PassThrough"),
+        }
+        match &segments[2] {
+            OutputSegment::SyncBlock { is_full_redraw, .. } => assert!(!is_full_redraw),
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_sync_block_data_preserved() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"inner content");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            OutputSegment::SyncBlock { data, .. } => {
+                // Data should contain SYNC_START + content + SYNC_END
+                assert!(data.starts_with(SYNC_START));
+                assert!(data.ends_with(SYNC_END));
+                // Inner content should be there
+                let inner = &data[SYNC_START.len()..data.len() - SYNC_END.len()];
+                assert_eq!(inner, b"inner content");
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_append_and_flush() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        // Start a sync block
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"partial");
+        parser.parse(&input, &mut segments);
+        assert!(parser.in_sync_block());
+
+        // Append more data and flush (simulating alt screen enter mid-sync)
+        let segment = parser.append_and_flush(b" remaining data");
+        assert!(!parser.in_sync_block());
+        match segment {
+            OutputSegment::SyncBlock { data, .. } => {
+                assert!(data.starts_with(SYNC_START));
+                // Should contain all buffered data
+                let s = String::from_utf8_lossy(&data);
+                assert!(s.contains("partial"));
+                assert!(s.contains(" remaining data"));
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_only_clear_screen_not_full_redraw() {
+        // Clear screen without cursor home should NOT be full redraw
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(CLEAR_SCREEN);
+        input.extend_from_slice(b"content");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            OutputSegment::SyncBlock { is_full_redraw, .. } => {
+                assert!(!is_full_redraw, "clear screen alone is not full redraw");
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_empty_chunk() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+        parser.parse(b"", &mut segments);
+        assert_eq!(segments.len(), 0);
+    }
 }
