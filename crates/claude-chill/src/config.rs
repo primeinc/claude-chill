@@ -1,7 +1,7 @@
 use crate::key_parser::{self, KeyCombination};
 use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 15000;
@@ -41,7 +41,7 @@ impl Config {
         dirs::config_dir().map(|d| d.join("claude-chill.toml"))
     }
 
-    fn load_from_file(path: &PathBuf) -> Self {
+    fn load_from_file(path: &Path) -> Self {
         match fs::read_to_string(path) {
             Ok(content) => match toml::from_str(&content) {
                 Ok(config) => config,
