@@ -20,14 +20,7 @@ impl LineBuffer {
 
     pub fn push_byte(&mut self, byte: u8) {
         if byte == b'\n' {
-            let line = std::mem::take(&mut self.current_line);
-            self.cached_bytes += line.len() + 1;
-            self.lines.push_back(line);
-            if self.lines.len() > self.max_lines
-                && let Some(removed) = self.lines.pop_front()
-            {
-                self.cached_bytes -= removed.len() + 1;
-            }
+            self.commit_line();
         } else {
             self.current_line.push(byte);
         }
@@ -38,25 +31,26 @@ impl LineBuffer {
         while pos < bytes.len() {
             match memchr(b'\n', &bytes[pos..]) {
                 Some(idx) => {
-                    // Append everything before (and not including) the newline to current_line
                     self.current_line.extend_from_slice(&bytes[pos..pos + idx]);
-                    // Commit the line
-                    let line = std::mem::take(&mut self.current_line);
-                    self.cached_bytes += line.len() + 1;
-                    self.lines.push_back(line);
-                    if self.lines.len() > self.max_lines
-                        && let Some(removed) = self.lines.pop_front()
-                    {
-                        self.cached_bytes -= removed.len() + 1;
-                    }
+                    self.commit_line();
                     pos += idx + 1;
                 }
                 None => {
-                    // No more newlines — append remainder to current_line
                     self.current_line.extend_from_slice(&bytes[pos..]);
                     break;
                 }
             }
+        }
+    }
+
+    fn commit_line(&mut self) {
+        let line = std::mem::take(&mut self.current_line);
+        self.cached_bytes += line.len() + 1;
+        self.lines.push_back(line);
+        if self.lines.len() > self.max_lines
+            && let Some(removed) = self.lines.pop_front()
+        {
+            self.cached_bytes -= removed.len() + 1;
         }
     }
 

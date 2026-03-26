@@ -1200,4 +1200,128 @@ mod tests {
             _ => panic!("expected SyncBlock"),
         }
     }
+
+    // ================================================================
+    // Additional edge-case tests
+    // ================================================================
+
+    #[test]
+    fn test_render_delay_no_output_yet() {
+        // No output has happened (elapsed = None → Duration::MAX → immediate)
+        assert_eq!(
+            compute_render_delay(true, false, false, false, None),
+            Some(Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn test_render_delay_exact_boundary_normal() {
+        // Exactly at the 5ms boundary
+        assert_eq!(
+            compute_render_delay(
+                true,
+                false,
+                false,
+                false,
+                Some(Duration::from_millis(RENDER_DELAY_MS))
+            ),
+            Some(Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn test_render_delay_exact_boundary_sync() {
+        // Exactly at the 50ms sync block boundary
+        assert_eq!(
+            compute_render_delay(
+                true,
+                false,
+                false,
+                true,
+                Some(Duration::from_millis(SYNC_BLOCK_DELAY_MS))
+            ),
+            Some(Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn test_render_delay_just_under_boundary() {
+        // 1ms under the 5ms boundary → should return 1ms
+        let result = compute_render_delay(
+            true,
+            false,
+            false,
+            false,
+            Some(Duration::from_millis(RENDER_DELAY_MS - 1)),
+        );
+        assert_eq!(result, Some(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn test_auto_lookback_exact_timeout_boundary() {
+        // stdin_idle == timeout exactly → should NOT trigger (< check is strict)
+        let now = Instant::now();
+        let timeout = Duration::from_secs(15);
+        assert!(!should_auto_lookback(
+            timeout,
+            false,
+            false,
+            Some(Duration::from_secs(14)), // just under threshold
+            Some(now - Duration::from_secs(10)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_just_over_timeout() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(15);
+        assert!(should_auto_lookback(
+            timeout,
+            false,
+            false,
+            Some(Duration::from_secs(16)), // just over threshold
+            Some(now - Duration::from_secs(10)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_sync_block_non_redraw_preserves_history() {
+        // A sync block without clear screen should NOT clear history
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"just some content");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            OutputSegment::SyncBlock { is_full_redraw, .. } => {
+                assert!(
+                    !is_full_redraw,
+                    "non-redraw sync block should not clear history"
+                );
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_history_filter_strips_mode_sequences() {
+        let mut filter = HistoryFilter::new();
+        // Focus tracking, mouse mode, bracketed paste should all be stripped
+        let input = b"\x1b[?1004h\x1b[?1000hvisible text\x1b[?2004h";
+        let output = filter.filter(input);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("visible text"));
+        assert!(!text.contains("1004"));
+        assert!(!text.contains("1000"));
+        assert!(!text.contains("2004"));
+    }
 }
