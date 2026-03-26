@@ -44,6 +44,7 @@ impl AltScreenTracker {
 
     /// Find the position of an alt screen enter sequence in the data.
     /// Returns the earliest match position (modern or legacy).
+    #[must_use]
     pub fn find_enter(&self, data: &[u8]) -> Option<usize> {
         let pos1 = self.enter_finder.find(data);
         let pos2 = self.enter_legacy_finder.find(data);
@@ -57,6 +58,7 @@ impl AltScreenTracker {
 
     /// Find the position of an alt screen exit sequence in the data.
     /// Returns the earliest match position (modern or legacy).
+    #[must_use]
     pub fn find_exit(&self, data: &[u8]) -> Option<usize> {
         let pos1 = self.exit_finder.find(data);
         let pos2 = self.exit_legacy_finder.find(data);
