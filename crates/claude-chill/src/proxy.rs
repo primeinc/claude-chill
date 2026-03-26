@@ -1,4 +1,7 @@
-//! PTY proxy: event loop, VT rendering, history management, and lookback mode.
+//! PTY proxy: event loop, lookback mode, and coordination between
+//! [`VtRenderer`](crate::vt_renderer::VtRenderer),
+//! [`HistoryManager`](crate::history_manager::HistoryManager),
+//! and terminal I/O.
 
 use crate::alt_screen::AltScreenTracker;
 #[cfg(test)]
