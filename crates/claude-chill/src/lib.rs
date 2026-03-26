@@ -4,10 +4,7 @@
 //! emulator, and maintains a scrollback history buffer accessible through a
 //! configurable hotkey.
 //!
-//! This crate is Unix-only (requires PTY, termios, and POSIX signals).
-
-#[cfg(not(unix))]
-compile_error!("claude-chill requires a Unix platform (Linux or macOS)");
+//! Supports Unix (PTY, termios, POSIX signals) and Windows (ConPTY, Console API).
 
 pub mod alt_screen;
 pub mod config;
@@ -15,10 +12,30 @@ pub mod escape_sequences;
 pub mod history_filter;
 pub mod history_manager;
 pub mod key_parser;
-pub mod kitty_tracker;
 pub mod line_buffer;
-pub mod proxy;
 pub mod sequence_match;
 pub mod sync_block;
-pub mod terminal;
 pub mod vt_renderer;
+
+// Platform-specific modules
+#[cfg(unix)]
+pub mod kitty_tracker;
+#[cfg(unix)]
+pub mod proxy;
+#[cfg(unix)]
+pub mod terminal;
+
+#[cfg(windows)]
+pub mod kitty_tracker_windows;
+#[cfg(windows)]
+pub mod proxy_windows;
+#[cfg(windows)]
+pub mod terminal_windows;
+
+// Re-export platform-specific modules under canonical names
+#[cfg(windows)]
+pub use kitty_tracker_windows as kitty_tracker;
+#[cfg(windows)]
+pub use proxy_windows as proxy;
+#[cfg(windows)]
+pub use terminal_windows as terminal;

@@ -344,13 +344,13 @@ mod tests {
         // interleaved with passthrough data.
         let mut parser = SyncBlockParser::new();
         let mut hm = HistoryManager::new(10000);
-        let mut segments = Vec::new();
 
         for i in 0..200 {
             // Passthrough text
             let text = format!("output line {i}\r\n");
+            let mut segments = Vec::new();
             parser.parse(text.as_bytes(), &mut segments);
-            for seg in segments.drain(..) {
+            for seg in segments {
                 hm.apply_segment(seg);
             }
 
@@ -363,8 +363,9 @@ mod tests {
             }
             block.extend_from_slice(format!("sync {i}\r\n").as_bytes());
             block.extend_from_slice(crate::escape_sequences::SYNC_END);
+            let mut segments = Vec::new();
             parser.parse(&block, &mut segments);
-            for seg in segments.drain(..) {
+            for seg in segments {
                 hm.apply_segment(seg);
             }
         }
