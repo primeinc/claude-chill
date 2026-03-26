@@ -478,8 +478,10 @@ impl Proxy {
             is_diff,
             self.output_buffer.len()
         );
-        self.kitty_tracker.process(&self.output_buffer);
-        write_all(stdout_fd, &self.output_buffer)?;
+        // Take the buffer temporarily to avoid borrow conflict with write_to_terminal
+        let buf = std::mem::take(&mut self.output_buffer);
+        self.write_to_terminal(stdout_fd, &buf)?;
+        self.output_buffer = buf;
 
         // Store current screen for next diff
         self.vt_prev_screen = Some(self.vt_parser.screen().clone());
