@@ -9,37 +9,24 @@ use crate::kitty_tracker::KittyTracker;
 use crate::line_buffer::LineBuffer;
 use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::{OutputSegment, SyncBlockParser};
+use crate::terminal::{
+    self, SIGINT_RECEIVED, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, exit_code_from_status,
+    get_terminal_size, nix_read, set_nonblocking, setup_raw_mode, setup_signal_handlers, write_all,
+};
 use anyhow::{Context, Result};
 use log::debug;
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::pty::{Winsize, openpty};
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
-use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
-use nix::unistd::{Pid, isatty, read, write};
+use nix::pty::openpty;
+use nix::sys::signal::{Signal, kill};
+use nix::sys::termios::Termios;
+use nix::unistd::{Pid, isatty, read};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-
-static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
-static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
-static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigwinch(_: libc::c_int) {
-    SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn handle_sigint(_: libc::c_int) {
-    SIGINT_RECEIVED.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn handle_sigterm(_: libc::c_int) {
-    SIGTERM_RECEIVED.store(true, Ordering::SeqCst);
-}
 
 pub struct ProxyConfig {
     pub max_history_lines: usize,
@@ -86,9 +73,7 @@ pub struct Proxy {
     alt_screen: AltScreenTracker,
     kitty_tracker: KittyTracker,
 
-    // Lookback input matching (stack-copied from config to avoid borrow conflicts)
-    lookback_sequence_legacy: Vec<u8>,
-    lookback_sequence_kitty: Vec<u8>,
+    // Lookback input matching
     lookback_input_buffer: Vec<u8>,
     lookback_cache: Vec<u8>,
 
@@ -103,6 +88,28 @@ pub struct Proxy {
     output_buffer: Vec<u8>,
 }
 
+/// Pure decision: should we skip the Kitty keyboard protocol DA query?
+/// Returns true if the terminal is known not to support Kitty protocol.
+fn should_skip_kitty_query(term_program: Option<&str>, term: Option<&str>) -> bool {
+    if let Some(tp) = term_program {
+        let tp_lower = tp.to_ascii_lowercase();
+        if matches!(
+            tp_lower.as_str(),
+            "apple_terminal" | "terminal.app" | "iterm.app" | "iterm2" | "hyper" | "terminus"
+        ) {
+            return true;
+        }
+    }
+
+    if let Some(t) = term {
+        if matches!(t, "dumb" | "linux" | "vt100" | "vt220") {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Detect Kitty keyboard protocol support and return a configured KittyTracker.
 fn detect_kitty_support() -> KittyTracker {
     // Skip the terminal query entirely if stdin isn't a TTY (e.g. piped input)
@@ -111,25 +118,16 @@ fn detect_kitty_support() -> KittyTracker {
         return KittyTracker::new(false, 0);
     }
 
-    // Check TERM_PROGRAM for terminals known not to support Kitty protocol.
-    // This avoids the 500ms query timeout on terminals that will never respond.
-    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
-        let tp = term_program.to_ascii_lowercase();
-        if matches!(
-            tp.as_str(),
-            "apple_terminal" | "terminal.app" | "iterm.app" | "iterm2" | "hyper" | "terminus"
-        ) {
-            debug!("Kitty detection skipped: TERM_PROGRAM={term_program} (known non-Kitty)");
-            return KittyTracker::new(false, 0);
-        }
-    }
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let term = std::env::var("TERM").ok();
 
-    // Also skip for TERM values that indicate a very basic terminal
-    if let Ok(term) = std::env::var("TERM") {
-        if matches!(term.as_str(), "dumb" | "linux" | "vt100" | "vt220") {
-            debug!("Kitty detection skipped: TERM={term} (basic terminal)");
-            return KittyTracker::new(false, 0);
-        }
+    if should_skip_kitty_query(term_program.as_deref(), term.as_deref()) {
+        debug!(
+            "Kitty detection skipped: TERM_PROGRAM={} TERM={} (known non-Kitty)",
+            term_program.as_deref().unwrap_or("(unset)"),
+            term.as_deref().unwrap_or("(unset)")
+        );
+        return KittyTracker::new(false, 0);
     }
 
     let (supported, initial_flags) = query_kitty_support();
@@ -274,8 +272,6 @@ impl Proxy {
         history.push_bytes(CURSOR_HOME);
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
-        let lookback_sequence_legacy = config.lookback_sequence_legacy.clone();
-        let lookback_sequence_kitty = config.lookback_sequence_kitty.clone();
 
         debug!("Proxy::spawn: command={command} args={args:?}");
 
@@ -283,8 +279,6 @@ impl Proxy {
             history,
             history_filter: HistoryFilter::new(),
             config,
-            lookback_sequence_legacy,
-            lookback_sequence_kitty,
             pty_master: pty.master,
             child,
             original_termios,
@@ -658,16 +652,20 @@ impl Proxy {
             return write_all(&self.pty_master, data);
         }
 
-        // Stack-copy to avoid borrowing self across mutable calls.
-        // Lookback sequences are always small (≤7 bytes).
+        // Stack-copy the active lookback sequence to avoid borrowing self.config
+        // across mutable calls. Lookback sequences are always small (≤16 bytes).
         let mut seq_buf = [0u8; 16];
         let seq = if self.kitty_tracker.mode_enabled() {
-            let len = self.lookback_sequence_kitty.len().min(seq_buf.len());
-            seq_buf[..len].copy_from_slice(&self.lookback_sequence_kitty[..len]);
+            let len = self.config.lookback_sequence_kitty.len().min(seq_buf.len());
+            seq_buf[..len].copy_from_slice(&self.config.lookback_sequence_kitty[..len]);
             &seq_buf[..len]
         } else {
-            let len = self.lookback_sequence_legacy.len().min(seq_buf.len());
-            seq_buf[..len].copy_from_slice(&self.lookback_sequence_legacy[..len]);
+            let len = self
+                .config
+                .lookback_sequence_legacy
+                .len()
+                .min(seq_buf.len());
+            seq_buf[..len].copy_from_slice(&self.config.lookback_sequence_legacy[..len]);
             &seq_buf[..len]
         };
 
@@ -823,95 +821,9 @@ impl Proxy {
 impl Drop for Proxy {
     fn drop(&mut self) {
         if let Some(ref termios) = self.original_termios {
-            let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
+            terminal::restore_termios(termios);
         }
     }
-}
-
-fn get_terminal_size() -> Result<Winsize> {
-    // SAFETY: Winsize is a plain C struct with no padding requirements;
-    // zeroed memory is a valid initial state. TIOCGWINSZ writes the
-    // terminal dimensions into ws; stdout is a valid fd.
-    let mut ws: Winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe {
-        libc::ioctl(
-            io::stdout().as_raw_fd(),
-            libc::TIOCGWINSZ as libc::c_ulong,
-            &mut ws,
-        )
-    };
-    if ret == -1 || ws.ws_row == 0 || ws.ws_col == 0 {
-        ws.ws_row = 24;
-        ws.ws_col = 80;
-    }
-    Ok(ws)
-}
-
-fn exit_code_from_status(status: ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(code) = status.code() {
-        code
-    } else if let Some(signal) = status.signal() {
-        128 + signal
-    } else {
-        1
-    }
-}
-
-fn setup_raw_mode() -> Result<Option<Termios>> {
-    let stdin = io::stdin();
-    if !isatty(&stdin).unwrap_or(false) {
-        return Ok(None);
-    }
-
-    let original = tcgetattr(&stdin).context("tcgetattr failed")?;
-    let mut raw = original.clone();
-    cfmakeraw(&mut raw);
-    tcsetattr(&stdin, SetArg::TCSANOW, &raw).context("tcsetattr failed")?;
-    Ok(Some(original))
-}
-
-fn setup_signal_handler(signal: Signal, handler: extern "C" fn(libc::c_int)) -> Result<()> {
-    let action = SigAction::new(
-        SigHandler::Handler(handler),
-        SaFlags::SA_RESTART,
-        SigSet::empty(),
-    );
-    // SAFETY: The signal handler only performs atomic stores, which is
-    // async-signal-safe. The SigAction is correctly constructed above.
-    unsafe { sigaction(signal, &action) }.context(format!("sigaction {signal:?} failed"))?;
-    Ok(())
-}
-
-fn setup_signal_handlers() -> Result<()> {
-    setup_signal_handler(Signal::SIGWINCH, handle_sigwinch)?;
-    setup_signal_handler(Signal::SIGINT, handle_sigint)?;
-    setup_signal_handler(Signal::SIGTERM, handle_sigterm)?;
-    Ok(())
-}
-
-fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
-    let flags = fcntl(fd.as_fd(), FcntlArg::F_GETFL).context("fcntl F_GETFL failed")?;
-    let flags = OFlag::from_bits_truncate(flags);
-    fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        .context("fcntl F_SETFL failed")?;
-    Ok(())
-}
-
-fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        match write(fd, &data[written..]) {
-            Ok(n) => written += n,
-            Err(Errno::EAGAIN) | Err(Errno::EINTR) => continue,
-            Err(e) => anyhow::bail!("write failed: {e}"),
-        }
-    }
-    Ok(())
-}
-
-fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
-    read(fd.as_fd(), buf)
 }
 
 /// Pure decision: should auto-lookback trigger?
@@ -1594,5 +1506,97 @@ mod tests {
             text.contains("sync content before alt"),
             "pre-alt sync content should be in history"
         );
+    }
+
+    // ================================================================
+    // Kitty detection skip logic tests
+    // ================================================================
+
+    #[test]
+    fn test_skip_kitty_apple_terminal() {
+        assert!(should_skip_kitty_query(Some("Apple_Terminal"), None));
+    }
+
+    #[test]
+    fn test_skip_kitty_terminal_app() {
+        assert!(should_skip_kitty_query(Some("Terminal.app"), None));
+    }
+
+    #[test]
+    fn test_skip_kitty_iterm2() {
+        assert!(should_skip_kitty_query(Some("iTerm2"), None));
+        assert!(should_skip_kitty_query(Some("iTerm.app"), None));
+    }
+
+    #[test]
+    fn test_skip_kitty_hyper() {
+        assert!(should_skip_kitty_query(Some("Hyper"), None));
+    }
+
+    #[test]
+    fn test_skip_kitty_terminus() {
+        assert!(should_skip_kitty_query(Some("Terminus"), None));
+    }
+
+    #[test]
+    fn test_skip_kitty_dumb_term() {
+        assert!(should_skip_kitty_query(None, Some("dumb")));
+    }
+
+    #[test]
+    fn test_skip_kitty_linux_console() {
+        assert!(should_skip_kitty_query(None, Some("linux")));
+    }
+
+    #[test]
+    fn test_skip_kitty_vt100() {
+        assert!(should_skip_kitty_query(None, Some("vt100")));
+        assert!(should_skip_kitty_query(None, Some("vt220")));
+    }
+
+    #[test]
+    fn test_no_skip_kitty_known_supporters() {
+        // Kitty, Ghostty, WezTerm should NOT be skipped
+        assert!(!should_skip_kitty_query(Some("kitty"), None));
+        assert!(!should_skip_kitty_query(Some("ghostty"), None));
+        assert!(!should_skip_kitty_query(Some("WezTerm"), None));
+    }
+
+    #[test]
+    fn test_no_skip_kitty_xterm256() {
+        assert!(!should_skip_kitty_query(None, Some("xterm-256color")));
+    }
+
+    #[test]
+    fn test_no_skip_kitty_unset() {
+        assert!(!should_skip_kitty_query(None, None));
+    }
+
+    #[test]
+    fn test_skip_kitty_case_insensitive_term_program() {
+        // TERM_PROGRAM check should be case-insensitive
+        assert!(should_skip_kitty_query(Some("APPLE_TERMINAL"), None));
+        assert!(should_skip_kitty_query(Some("apple_terminal"), None));
+        assert!(should_skip_kitty_query(Some("ITERM2"), None));
+    }
+
+    #[test]
+    fn test_skip_kitty_term_program_takes_priority() {
+        // If TERM_PROGRAM is a known non-Kitty, skip even with a good TERM
+        assert!(should_skip_kitty_query(
+            Some("Apple_Terminal"),
+            Some("xterm-256color")
+        ));
+    }
+
+    #[test]
+    fn test_no_skip_kitty_unknown_term_program() {
+        // Unknown TERM_PROGRAM with basic TERM → skip (due to TERM)
+        assert!(should_skip_kitty_query(Some("SomeUnknown"), Some("dumb")));
+        // Unknown TERM_PROGRAM with good TERM → don't skip
+        assert!(!should_skip_kitty_query(
+            Some("SomeUnknown"),
+            Some("xterm-256color")
+        ));
     }
 }
