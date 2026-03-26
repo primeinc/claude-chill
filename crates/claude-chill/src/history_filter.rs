@@ -33,11 +33,10 @@ impl HistoryFilter {
     /// Filter bytes, returning only safe sequences for history.
     pub fn filter(&mut self, input: &[u8]) -> Vec<u8> {
         let actions = self.parser.parse_as_vec(input);
-        let mut output = String::new();
+        let mut output = String::with_capacity(input.len());
 
         for action in actions {
             if is_safe_for_history(&action) {
-                // Re-encode the action
                 let _ = write!(output, "{action}");
             }
         }
