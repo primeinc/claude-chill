@@ -488,4 +488,64 @@ mod tests {
             _ => panic!("expected SyncBlock"),
         }
     }
+
+    #[test]
+    fn test_deterministic_varied_patterns() {
+        // Feed many different input patterns to verify no panics.
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        // Pattern 1: Many small chunks interleaved with sync blocks
+        for i in 0..100 {
+            let text = format!("line {i}\r\n");
+            parser.parse(text.as_bytes(), &mut segments);
+            segments.clear();
+
+            let mut block = Vec::new();
+            block.extend_from_slice(SYNC_START);
+            block.extend_from_slice(format!("block {i}").as_bytes());
+            block.extend_from_slice(SYNC_END);
+            parser.parse(&block, &mut segments);
+            segments.clear();
+        }
+        assert!(!parser.in_sync_block());
+
+        // Pattern 2: Large single chunk with many sync blocks
+        let mut big_chunk = Vec::new();
+        for i in 0..50 {
+            big_chunk.extend_from_slice(format!("text {i} ").as_bytes());
+            big_chunk.extend_from_slice(SYNC_START);
+            if i % 5 == 0 {
+                big_chunk.extend_from_slice(CLEAR_SCREEN);
+                big_chunk.extend_from_slice(CURSOR_HOME);
+            }
+            big_chunk.extend_from_slice(format!("sync {i}").as_bytes());
+            big_chunk.extend_from_slice(SYNC_END);
+        }
+        parser.parse(&big_chunk, &mut segments);
+        // Should have 50 passthrough + 50 sync blocks = 100 segments
+        assert_eq!(segments.len(), 100);
+        segments.clear();
+
+        // Pattern 3: Sync block that spans many small chunks
+        let mut start_chunk = Vec::new();
+        start_chunk.extend_from_slice(SYNC_START);
+        start_chunk.extend_from_slice(b"begin ");
+        parser.parse(&start_chunk, &mut segments);
+        assert!(parser.in_sync_block());
+        assert!(segments.is_empty());
+
+        for i in 0..20 {
+            let mid = format!("middle {i} ");
+            parser.parse(mid.as_bytes(), &mut segments);
+            assert!(segments.is_empty());
+        }
+
+        let mut end_chunk = Vec::new();
+        end_chunk.extend_from_slice(b"end");
+        end_chunk.extend_from_slice(SYNC_END);
+        parser.parse(&end_chunk, &mut segments);
+        assert_eq!(segments.len(), 1);
+        assert!(!parser.in_sync_block());
+    }
 }
