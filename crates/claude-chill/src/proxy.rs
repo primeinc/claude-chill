@@ -28,11 +28,17 @@ use std::process::{Child, Command};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+/// Configuration for the PTY proxy.
 pub struct ProxyConfig {
+    /// Maximum number of lines retained in the lookback history buffer.
     pub max_history_lines: usize,
+    /// Human-readable key name for display in the lookback mode banner.
     pub lookback_key: String,
+    /// Byte sequence that triggers lookback mode in legacy terminal mode.
     pub lookback_sequence_legacy: Vec<u8>,
+    /// Byte sequence that triggers lookback mode in Kitty keyboard protocol mode.
     pub lookback_sequence_kitty: Vec<u8>,
+    /// Idle timeout in ms before auto-lookback triggers (0 to disable).
     pub auto_lookback_timeout_ms: u64,
 }
 
@@ -51,6 +57,8 @@ impl Default for ProxyConfig {
 const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
 
+/// PTY proxy that sits between a terminal and a child process, providing
+/// VT-based differential rendering and scrollback history.
 pub struct Proxy {
     // Process & terminal
     config: ProxyConfig,
@@ -89,6 +97,11 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// Spawn a child process in a PTY and return a proxy ready to run.
+    ///
+    /// Sets up raw mode, signal handlers, and Kitty protocol detection before
+    /// spawning the child. The caller should call [`run`](Self::run) to enter
+    /// the event loop.
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
         anyhow::ensure!(
             !config.lookback_sequence_legacy.is_empty(),
@@ -187,6 +200,8 @@ impl Proxy {
         })
     }
 
+    /// Run the proxy event loop until the child process exits.
+    /// Returns the child's exit code.
     pub fn run(&mut self) -> Result<i32> {
         let stdin_fd = io::stdin();
         let stdout_fd = io::stdout();

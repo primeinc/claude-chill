@@ -16,6 +16,7 @@ pub struct KittyTracker {
 }
 
 impl KittyTracker {
+    /// Create a new tracker with known support status and initial stack depth.
     pub fn new(supported: bool, initial_stack: u32) -> Self {
         Self {
             parser: TermwizParser::new(),
