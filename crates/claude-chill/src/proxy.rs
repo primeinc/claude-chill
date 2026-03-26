@@ -332,7 +332,7 @@ impl Proxy {
             // then flush any remaining sync block state with the rest
             let before_alt = &data[..alt_pos];
             if !before_alt.is_empty() {
-                let mut segments = Vec::new();
+                let mut segments = Vec::with_capacity(4);
                 self.sync_parser.parse(before_alt, &mut segments);
                 for segment in segments {
                     self.apply_segment_to_history(segment);
@@ -352,7 +352,7 @@ impl Proxy {
             return self.process_output_alt_screen(&data[alt_pos + seq_len..], stdout_fd);
         }
 
-        let mut segments = Vec::new();
+        let mut segments = Vec::with_capacity(4);
         self.sync_parser.parse(data, &mut segments);
         for segment in segments {
             self.apply_segment_to_history(segment);
