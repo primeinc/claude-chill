@@ -3,18 +3,18 @@
 use crate::alt_screen::AltScreenTracker;
 #[cfg(test)]
 use crate::escape_sequences::ALT_SCREEN_ENTER;
-use crate::escape_sequences::{
-    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_END, SYNC_START,
-};
-use crate::history_filter::HistoryFilter;
+#[cfg(test)]
+use crate::escape_sequences::SYNC_START;
+use crate::escape_sequences::{CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY};
+use crate::history_manager::HistoryManager;
 use crate::kitty_tracker::KittyTracker;
-use crate::line_buffer::LineBuffer;
 use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::{OutputSegment, SyncBlockParser};
 use crate::terminal::{
     self, SIGINT_RECEIVED, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, exit_code_from_status,
     get_terminal_size, nix_read, set_nonblocking, setup_raw_mode, setup_signal_handlers, write_all,
 };
+use crate::vt_renderer::VtRenderer;
 use anyhow::{Context, Result};
 use log::debug;
 use nix::errno::Errno;
@@ -56,9 +56,6 @@ impl Default for ProxyConfig {
     }
 }
 
-const RENDER_DELAY_MS: u64 = 5;
-const SYNC_BLOCK_DELAY_MS: u64 = 50;
-
 /// PTY proxy that sits between a terminal and a child process, providing
 /// VT-based differential rendering and scrollback history.
 pub struct Proxy {
@@ -68,15 +65,12 @@ pub struct Proxy {
     child: Child,
     original_termios: Option<Termios>,
 
-    // VT emulation
-    vt_parser: vt100::Parser,
-    vt_prev_screen: Option<vt100::Screen>,
-    vt_render_pending: bool,
+    // VT rendering
+    renderer: VtRenderer,
     sync_parser: SyncBlockParser,
 
     // History & filtering
-    history: LineBuffer,
-    history_filter: HistoryFilter,
+    history: HistoryManager,
 
     // Mode tracking
     in_lookback_mode: bool,
@@ -88,13 +82,11 @@ pub struct Proxy {
     lookback_cache: Vec<u8>,
 
     // Timing
-    last_output_time: Option<Instant>,
-    last_render_time: Option<Instant>,
     last_stdin_time: Option<Instant>,
     last_auto_lookback_time: Option<Instant>,
     auto_lookback_timeout: Duration,
 
-    // Reusable write buffer (avoids per-render allocation)
+    // Reusable write buffer for history dump / lookback
     output_buffer: Vec<u8>,
 }
 
@@ -166,12 +158,9 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
-        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
+        let renderer = VtRenderer::new(winsize.ws_row, winsize.ws_col);
 
-        // Seed history with clear screen so replay starts fresh
-        let mut history = LineBuffer::new(config.max_history_lines);
-        history.push_bytes(CLEAR_SCREEN);
-        history.push_bytes(CURSOR_HOME);
+        let history = HistoryManager::new(config.max_history_lines);
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
 
@@ -179,15 +168,11 @@ impl Proxy {
 
         Ok(Self {
             history,
-            history_filter: HistoryFilter::new(),
             config,
             pty_master: pty.master,
             child,
             original_termios,
-            vt_parser,
-            vt_prev_screen: None,
-            last_output_time: None,
-            last_render_time: None,
+            renderer,
             last_stdin_time: None,
             last_auto_lookback_time: None,
             auto_lookback_timeout,
@@ -195,10 +180,9 @@ impl Proxy {
             in_lookback_mode: false,
             alt_screen: AltScreenTracker::new(),
             kitty_tracker,
-            vt_render_pending: false,
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
-            output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            output_buffer: Vec::with_capacity(crate::escape_sequences::OUTPUT_BUFFER_CAPACITY),
         })
     }
 
@@ -233,7 +217,12 @@ impl Proxy {
             ];
 
             let poll_timeout_ms = self
-                .time_until_render()
+                .renderer
+                .time_until_render(
+                    self.in_lookback_mode,
+                    self.alt_screen.in_alternate_screen(),
+                    self.sync_parser.in_sync_block(),
+                )
                 .map(|d| d.as_millis().min(100) as u16)
                 .unwrap_or(100);
 
@@ -278,7 +267,7 @@ impl Proxy {
         }
 
         // Final render before exit
-        if self.vt_render_pending {
+        if self.renderer.is_pending() {
             self.render_vt_screen(&stdout_fd)?;
         }
 
@@ -307,7 +296,7 @@ impl Proxy {
             // Feed VT but NOT history while in alt screen
             // Alt screen content (TUI editors, etc.) shouldn't be in lookback history
             if feed_vt {
-                self.vt_parser.process(data);
+                self.renderer.process(data);
             }
             return self.process_output_alt_screen(data, stdout_fd);
         }
@@ -320,10 +309,9 @@ impl Proxy {
 
         // Feed data to VT emulator (unless already fed by caller)
         if feed_vt {
-            self.vt_parser.process(data);
+            self.renderer.process(data);
         }
-        self.vt_render_pending = true;
-        self.last_output_time = Some(Instant::now());
+        self.renderer.mark_pending();
 
         // Process sync blocks for history management, watching for alt screen enter
         if let Some(alt_pos) = self.alt_screen.find_enter(data) {
@@ -361,6 +349,11 @@ impl Proxy {
         Ok(())
     }
 
+    /// Handle output while in alternate screen mode (TUI editors, etc.).
+    ///
+    /// Passes data directly to the terminal. When an alt-screen exit is found,
+    /// restores the main screen via a full VT render and checks remaining data
+    /// for another alt-screen enter (handles rapid enter/exit in a single chunk).
     fn process_output_alt_screen<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         if let Some(exit_pos) = self.alt_screen.find_exit(data) {
             debug!("process_output_alt_screen: ALT_SCREEN_EXIT detected at pos={exit_pos}");
@@ -371,7 +364,7 @@ impl Proxy {
 
             // Force full VT render to restore main screen content
             debug!("process_output_alt_screen: rendering VT screen after alt exit");
-            self.vt_prev_screen = None;
+            self.renderer.force_full_render();
             self.render_vt_screen(stdout_fd)?;
 
             // Data after ALT_EXIT was already fed to VT and history when we processed
@@ -403,90 +396,32 @@ impl Proxy {
 
     /// Write data to the terminal and track Kitty keyboard protocol state
     fn write_to_terminal<F: AsFd>(&mut self, stdout_fd: &F, data: &[u8]) -> Result<()> {
-        self.kitty_tracker.process(data);
-        write_all(stdout_fd, data)
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, data)
     }
 
     fn apply_segment_to_history(&mut self, segment: OutputSegment<'_>) {
-        match segment {
-            OutputSegment::PassThrough(data) => {
-                self.push_to_history(data);
-            }
-            OutputSegment::SyncBlock {
-                data,
-                is_full_redraw,
-            } => {
-                if is_full_redraw {
-                    debug!("CLEARING HISTORY");
-                    self.history.clear();
-                    self.history.push_bytes(CLEAR_SCREEN);
-                    self.history.push_bytes(CURSOR_HOME);
-                }
-                self.push_to_history(&data);
-            }
-        }
+        self.history.apply_segment(segment);
     }
 
-    /// Push data to history, filtering out terminal query sequences that would
-    /// cause the terminal to respond when replayed.
     fn push_to_history(&mut self, data: &[u8]) {
-        let filtered = self.history_filter.filter(data);
-        self.history.push_bytes(filtered.as_ref());
+        self.history.push(data);
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        if let Some(Duration::ZERO) = self.time_until_render() {
+        if let Some(Duration::ZERO) = self.renderer.time_until_render(
+            self.in_lookback_mode,
+            self.alt_screen.in_alternate_screen(),
+            self.sync_parser.in_sync_block(),
+        ) {
             self.render_vt_screen(stdout_fd)?;
         }
         Ok(())
     }
 
-    fn time_until_render(&self) -> Option<Duration> {
-        compute_render_delay(
-            self.vt_render_pending,
-            self.in_lookback_mode,
-            self.alt_screen.in_alternate_screen(),
-            self.sync_parser.in_sync_block(),
-            self.last_output_time.map(|t| t.elapsed()),
-        )
-    }
-
     fn render_vt_screen<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        let is_diff = self.vt_prev_screen.is_some();
-        self.output_buffer.clear();
-        self.output_buffer.extend_from_slice(SYNC_START);
-
-        match &self.vt_prev_screen {
-            Some(prev) => {
-                // Diff-based render: only send changes
-                self.output_buffer
-                    .extend_from_slice(&self.vt_parser.screen().contents_diff(prev));
-            }
-            None => {
-                // First render: full screen
-                self.output_buffer
-                    .extend_from_slice(&self.vt_parser.screen().contents_formatted());
-            }
+        if let Some(bytes) = self.renderer.render() {
+            write_to_terminal(&mut self.kitty_tracker, stdout_fd, bytes)?;
         }
-
-        self.output_buffer
-            .extend_from_slice(&self.vt_parser.screen().cursor_state_formatted());
-        self.output_buffer.extend_from_slice(SYNC_END);
-
-        debug!(
-            "render_vt_screen: diff={} output_len={}\n",
-            is_diff,
-            self.output_buffer.len()
-        );
-        // Take the buffer temporarily to avoid borrow conflict with write_to_terminal
-        let buf = std::mem::take(&mut self.output_buffer);
-        self.write_to_terminal(stdout_fd, &buf)?;
-        self.output_buffer = buf;
-
-        // Store current screen for next diff
-        self.vt_prev_screen = Some(self.vt_parser.screen().clone());
-        self.vt_render_pending = false;
-        self.last_render_time = Some(Instant::now());
         Ok(())
     }
 
@@ -497,7 +432,7 @@ impl Proxy {
             self.in_lookback_mode,
             self.alt_screen.in_alternate_screen(),
             self.last_stdin_time.map(|t| now.duration_since(t)),
-            self.last_render_time,
+            self.renderer.last_render_time(),
             self.last_auto_lookback_time,
             now,
         ) {
@@ -509,7 +444,8 @@ impl Proxy {
             self.last_stdin_time
                 .map(|t| t.elapsed().as_millis())
                 .unwrap_or(0),
-            self.last_render_time
+            self.renderer
+                .last_render_time()
                 .map(|t| t.elapsed().as_millis())
                 .unwrap_or(0),
             self.last_auto_lookback_time
@@ -541,15 +477,12 @@ impl Proxy {
             debug!("Failed to write history file: {e}");
         }
 
-        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
-        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
-        // Take the buffer temporarily to avoid borrow conflict with write_to_terminal
-        let buf = std::mem::take(&mut self.output_buffer);
-        self.write_to_terminal(stdout_fd, &buf)?;
-        self.output_buffer = buf;
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, CLEAR_SCREEN)?;
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, CURSOR_HOME)?;
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, &self.output_buffer)?;
 
         // Force full VT render on next output since terminal now shows history
-        self.vt_prev_screen = None;
+        self.renderer.force_full_render();
         Ok(())
     }
 
@@ -636,7 +569,7 @@ impl Proxy {
         );
         self.in_lookback_mode = true;
         self.lookback_cache.clear();
-        self.vt_render_pending = false;
+        self.renderer.cancel_pending();
 
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
@@ -645,12 +578,9 @@ impl Proxy {
             self.output_buffer.len()
         );
 
-        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
-        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
-        // Take the buffer temporarily to avoid borrow conflict with write_to_terminal
-        let buf = std::mem::take(&mut self.output_buffer);
-        self.write_to_terminal(stdout_fd, &buf)?;
-        self.output_buffer = buf;
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, CLEAR_SCREEN)?;
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, CURSOR_HOME)?;
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, &self.output_buffer)?;
 
         let exit_msg = format!(
             "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
@@ -689,7 +619,7 @@ impl Proxy {
 
         // Force full render since terminal was showing history
         debug!("exit_lookback_mode: rendering VT screen");
-        self.vt_prev_screen = None;
+        self.renderer.force_full_render();
         self.render_vt_screen(stdout_fd)?;
 
         Ok(())
@@ -701,12 +631,8 @@ impl Proxy {
                 "forward_winsize: rows={} cols={}",
                 winsize.ws_row, winsize.ws_col
             );
-            // Resize VT emulator
-            self.vt_parser
-                .screen_mut()
-                .set_size(winsize.ws_row, winsize.ws_col);
-            // Force full render on next frame since size changed
-            self.vt_prev_screen = None;
+            // Resize VT emulator and force full render on next frame
+            self.renderer.resize(winsize.ws_row, winsize.ws_col);
             // SAFETY: pty_master is a valid fd (OwnedFd), winsize is a valid
             // Winsize struct just obtained from get_terminal_size. TIOCSWINSZ
             // reads the struct and applies the size to the PTY.
@@ -785,32 +711,10 @@ fn should_auto_lookback(
     true
 }
 
-/// Pure decision: compute the delay before the next VT render.
-/// Returns None if no render is pending or rendering is suppressed.
-fn compute_render_delay(
-    vt_render_pending: bool,
-    in_lookback_mode: bool,
-    in_alt_screen: bool,
-    in_sync_block: bool,
-    output_elapsed: Option<Duration>,
-) -> Option<Duration> {
-    if !vt_render_pending || in_lookback_mode || in_alt_screen {
-        return None;
-    }
-
-    let elapsed = output_elapsed.unwrap_or(Duration::MAX);
-
-    let delay = if in_sync_block {
-        Duration::from_millis(SYNC_BLOCK_DELAY_MS)
-    } else {
-        Duration::from_millis(RENDER_DELAY_MS)
-    };
-
-    if elapsed >= delay {
-        Some(Duration::ZERO)
-    } else {
-        Some(delay - elapsed)
-    }
+/// Write data to the terminal while tracking Kitty keyboard protocol state.
+fn write_to_terminal<F: AsFd>(kitty: &mut KittyTracker, stdout_fd: &F, data: &[u8]) -> Result<()> {
+    kitty.process(data);
+    write_all(stdout_fd, data)
 }
 
 #[cfg(test)]
@@ -969,188 +873,8 @@ mod tests {
     }
 
     // ================================================================
-    // Render delay decision tests
+    // Additional auto-lookback edge cases
     // ================================================================
-
-    #[test]
-    fn test_render_delay_none_when_not_pending() {
-        assert_eq!(
-            compute_render_delay(false, false, false, false, Some(Duration::from_millis(100))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_render_delay_none_in_lookback() {
-        assert_eq!(
-            compute_render_delay(true, true, false, false, Some(Duration::from_millis(100))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_render_delay_none_in_alt_screen() {
-        assert_eq!(
-            compute_render_delay(true, false, true, false, Some(Duration::from_millis(100))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_render_delay_immediate_when_enough_time_passed() {
-        assert_eq!(
-            compute_render_delay(true, false, false, false, Some(Duration::from_millis(100))),
-            Some(Duration::ZERO),
-        );
-    }
-
-    #[test]
-    fn test_render_delay_short_outside_sync_block() {
-        // 2ms elapsed, 5ms delay → 3ms remaining
-        let result =
-            compute_render_delay(true, false, false, false, Some(Duration::from_millis(2)));
-        assert!(result.is_some());
-        let remaining = result.unwrap();
-        assert!(remaining > Duration::ZERO);
-        assert!(remaining <= Duration::from_millis(RENDER_DELAY_MS));
-    }
-
-    #[test]
-    fn test_render_delay_longer_in_sync_block() {
-        // 10ms elapsed, 50ms sync delay → 40ms remaining
-        let result =
-            compute_render_delay(true, false, false, true, Some(Duration::from_millis(10)));
-        assert!(result.is_some());
-        let remaining = result.unwrap();
-        assert!(remaining > Duration::from_millis(30));
-        assert!(remaining <= Duration::from_millis(SYNC_BLOCK_DELAY_MS));
-    }
-
-    #[test]
-    fn test_render_delay_immediate_when_sync_delay_exceeded() {
-        assert_eq!(
-            compute_render_delay(true, false, false, true, Some(Duration::from_millis(100))),
-            Some(Duration::ZERO),
-        );
-    }
-
-    // ================================================================
-    // apply_segment_to_history tests (via LineBuffer directly)
-    // ================================================================
-
-    #[test]
-    fn test_apply_passthrough_to_history() {
-        let mut history = LineBuffer::new(1000);
-        let mut history_filter = HistoryFilter::new();
-
-        let data = b"hello world\n";
-        let filtered = history_filter.filter(data);
-        history.push_bytes(filtered.as_ref());
-
-        let mut output = Vec::new();
-        history.append_all(&mut output);
-        assert!(!output.is_empty());
-        let text = String::from_utf8_lossy(&output);
-        assert!(text.contains("hello world"));
-    }
-
-    #[test]
-    fn test_history_cleared_on_full_redraw() {
-        let mut history = LineBuffer::new(1000);
-        history.push_bytes(b"old content\n");
-
-        // Simulate full redraw: clear history and re-seed
-        history.clear();
-        history.push_bytes(CLEAR_SCREEN);
-        history.push_bytes(CURSOR_HOME);
-        history.push_bytes(b"new content\n");
-
-        let mut output = Vec::new();
-        history.append_all(&mut output);
-        let text = String::from_utf8_lossy(&output);
-        assert!(!text.contains("old content"));
-        assert!(text.contains("new content"));
-    }
-
-    #[test]
-    fn test_sync_block_full_redraw_detection() {
-        let mut parser = SyncBlockParser::new();
-        let mut segments = Vec::new();
-
-        let mut input = Vec::new();
-        input.extend_from_slice(SYNC_START);
-        input.extend_from_slice(CLEAR_SCREEN);
-        input.extend_from_slice(CURSOR_HOME);
-        input.extend_from_slice(b"screen content");
-        input.extend_from_slice(SYNC_END);
-
-        parser.parse(&input, &mut segments);
-        assert_eq!(segments.len(), 1);
-
-        // Simulate apply_segment_to_history behavior
-        match &segments[0] {
-            OutputSegment::SyncBlock { is_full_redraw, .. } => {
-                assert!(is_full_redraw, "should detect full redraw");
-            }
-            _ => panic!("expected SyncBlock"),
-        }
-    }
-
-    // ================================================================
-    // Additional edge-case tests
-    // ================================================================
-
-    #[test]
-    fn test_render_delay_no_output_yet() {
-        // No output has happened (elapsed = None → Duration::MAX → immediate)
-        assert_eq!(
-            compute_render_delay(true, false, false, false, None),
-            Some(Duration::ZERO),
-        );
-    }
-
-    #[test]
-    fn test_render_delay_exact_boundary_normal() {
-        // Exactly at the 5ms boundary
-        assert_eq!(
-            compute_render_delay(
-                true,
-                false,
-                false,
-                false,
-                Some(Duration::from_millis(RENDER_DELAY_MS))
-            ),
-            Some(Duration::ZERO),
-        );
-    }
-
-    #[test]
-    fn test_render_delay_exact_boundary_sync() {
-        // Exactly at the 50ms sync block boundary
-        assert_eq!(
-            compute_render_delay(
-                true,
-                false,
-                false,
-                true,
-                Some(Duration::from_millis(SYNC_BLOCK_DELAY_MS))
-            ),
-            Some(Duration::ZERO),
-        );
-    }
-
-    #[test]
-    fn test_render_delay_just_under_boundary() {
-        // 1ms under the 5ms boundary → should return 1ms
-        let result = compute_render_delay(
-            true,
-            false,
-            false,
-            false,
-            Some(Duration::from_millis(RENDER_DELAY_MS - 1)),
-        );
-        assert_eq!(result, Some(Duration::from_millis(1)));
-    }
 
     #[test]
     fn test_auto_lookback_exact_timeout_boundary() {
@@ -1183,203 +907,29 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_sync_block_non_redraw_preserves_history() {
-        // A sync block without clear screen should NOT clear history
-        let mut parser = SyncBlockParser::new();
-        let mut segments = Vec::new();
-
-        let mut input = Vec::new();
-        input.extend_from_slice(SYNC_START);
-        input.extend_from_slice(b"just some content");
-        input.extend_from_slice(SYNC_END);
-
-        parser.parse(&input, &mut segments);
-        assert_eq!(segments.len(), 1);
-        match &segments[0] {
-            OutputSegment::SyncBlock { is_full_redraw, .. } => {
-                assert!(
-                    !is_full_redraw,
-                    "non-redraw sync block should not clear history"
-                );
-            }
-            _ => panic!("expected SyncBlock"),
-        }
-    }
-
-    #[test]
-    fn test_history_filter_strips_mode_sequences() {
-        let mut filter = HistoryFilter::new();
-        // Focus tracking, mouse mode, bracketed paste should all be stripped
-        let input = b"\x1b[?1004h\x1b[?1000hvisible text\x1b[?2004h";
-        let output = filter.filter(input);
-        let text = String::from_utf8_lossy(&output);
-        assert!(text.contains("visible text"));
-        assert!(!text.contains("1004"));
-        assert!(!text.contains("1000"));
-        assert!(!text.contains("2004"));
-    }
-
     // ================================================================
-    // Simulated output flow: sync parser + history integration
+    // Alt screen + sync block interaction (proxy-specific concern)
     // ================================================================
 
-    /// Helper: simulate apply_segment_to_history logic from Proxy
-    fn apply_segment(
-        history: &mut LineBuffer,
-        filter: &mut HistoryFilter,
-        segment: OutputSegment<'_>,
-    ) {
-        match segment {
-            OutputSegment::PassThrough(data) => {
-                let filtered = filter.filter(data);
-                history.push_bytes(filtered.as_ref());
-            }
-            OutputSegment::SyncBlock {
-                data,
-                is_full_redraw,
-            } => {
-                if is_full_redraw {
-                    history.clear();
-                    history.push_bytes(CLEAR_SCREEN);
-                    history.push_bytes(CURSOR_HOME);
-                }
-                let filtered = filter.filter(&data);
-                history.push_bytes(filtered.as_ref());
-            }
-        }
-    }
-
-    fn history_text(history: &LineBuffer) -> String {
+    fn history_text(hm: &HistoryManager) -> String {
         let mut output = Vec::new();
-        history.append_all(&mut output);
+        hm.append_all(&mut output);
         String::from_utf8_lossy(&output).into_owned()
     }
 
     #[test]
-    fn test_realistic_output_flow() {
-        let mut parser = SyncBlockParser::new();
-        let mut history = LineBuffer::new(10000);
-        let mut filter = HistoryFilter::new();
-
-        // Seed history like Proxy::spawn does
-        history.push_bytes(CLEAR_SCREEN);
-        history.push_bytes(CURSOR_HOME);
-
-        // Step 1: passthrough text (initial shell output)
-        let mut segments = Vec::new();
-        parser.parse(b"$ claude\r\nStarting...\r\n", &mut segments);
-        for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
-        }
-        let text = history_text(&history);
-        assert!(text.contains("Starting..."), "passthrough text in history");
-
-        // Step 2: partial sync block (update without full redraw)
-        let mut partial_sync = Vec::new();
-        partial_sync.extend_from_slice(SYNC_START);
-        partial_sync.extend_from_slice(b"\x1b[10;1HThinking...");
-        partial_sync.extend_from_slice(SYNC_END);
-        parser.parse(&partial_sync, &mut segments);
-        for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
-        }
-        let text = history_text(&history);
-        assert!(
-            text.contains("Starting..."),
-            "old text preserved after partial sync"
-        );
-        assert!(
-            text.contains("Thinking..."),
-            "new text added after partial sync"
-        );
-
-        // Step 3: full redraw sync block (clears history)
-        let mut full_redraw = Vec::new();
-        full_redraw.extend_from_slice(SYNC_START);
-        full_redraw.extend_from_slice(CLEAR_SCREEN);
-        full_redraw.extend_from_slice(CURSOR_HOME);
-        full_redraw.extend_from_slice(b"Fresh screen content\r\n");
-        full_redraw.extend_from_slice(SYNC_END);
-        parser.parse(&full_redraw, &mut segments);
-        for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
-        }
-        let text = history_text(&history);
-        assert!(
-            !text.contains("Starting..."),
-            "old text cleared after full redraw"
-        );
-        assert!(
-            !text.contains("Thinking..."),
-            "partial sync text cleared after full redraw"
-        );
-        assert!(
-            text.contains("Fresh screen content"),
-            "new content present after full redraw"
-        );
-    }
-
-    #[test]
-    fn test_split_sync_block_across_chunks_with_history() {
-        let mut parser = SyncBlockParser::new();
-        let mut history = LineBuffer::new(10000);
-        let mut filter = HistoryFilter::new();
-
-        // Chunk 1: start of sync block
-        let mut chunk1 = Vec::new();
-        chunk1.extend_from_slice(b"preamble\r\n");
-        chunk1.extend_from_slice(SYNC_START);
-        chunk1.extend_from_slice(b"partial con");
-
-        let mut segments = Vec::new();
-        parser.parse(&chunk1, &mut segments);
-        for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
-        }
-        let text = history_text(&history);
-        assert!(
-            text.contains("preamble"),
-            "passthrough before sync should be in history"
-        );
-        assert!(parser.in_sync_block(), "should be mid-sync-block");
-
-        // Chunk 2: end of sync block
-        let mut chunk2 = Vec::new();
-        chunk2.extend_from_slice(b"tent here");
-        chunk2.extend_from_slice(SYNC_END);
-        chunk2.extend_from_slice(b"\r\nafter sync\r\n");
-
-        parser.parse(&chunk2, &mut segments);
-        for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
-        }
-        let text = history_text(&history);
-        assert!(
-            text.contains("after sync"),
-            "text after sync block should be in history"
-        );
-        assert!(!parser.in_sync_block(), "should be outside sync block");
-    }
-
-    #[test]
     fn test_alt_screen_enter_during_sync_block() {
-        // Simulates the scenario from proxy.rs:375-398 where alt screen
-        // enter occurs in the middle of a sync block.
+        // Simulates the scenario where alt screen enter occurs in the
+        // middle of a sync block.
         let mut parser = SyncBlockParser::new();
-        let mut history = LineBuffer::new(10000);
-        let mut filter = HistoryFilter::new();
+        let mut hm = HistoryManager::new(10000);
         let alt_tracker = AltScreenTracker::new();
-
-        // Seed history
-        history.push_bytes(CLEAR_SCREEN);
-        history.push_bytes(CURSOR_HOME);
 
         // Preamble text
         let mut segments = Vec::new();
         parser.parse(b"initial output\r\n", &mut segments);
         for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
+            hm.apply_segment(seg);
         }
 
         // Build a chunk that starts a sync block, then has alt screen enter mid-block
@@ -1401,7 +951,7 @@ mod tests {
         let before_alt = &chunk[..alt_pos];
         parser.parse(before_alt, &mut segments);
         for seg in segments.drain(..) {
-            apply_segment(&mut history, &mut filter, seg);
+            hm.apply_segment(seg);
         }
 
         // Flush the open sync block with remaining data (simulating what proxy does)
@@ -1411,19 +961,18 @@ mod tests {
         );
         let remaining = &chunk[alt_pos..];
         let segment = parser.append_and_flush(remaining);
-        apply_segment(&mut history, &mut filter, segment);
+        hm.apply_segment(segment);
 
         assert!(
             !parser.in_sync_block(),
             "sync block should be flushed after alt screen"
         );
 
-        let text = history_text(&history);
+        let text = history_text(&hm);
         assert!(
             text.contains("initial output"),
             "preamble should be in history"
         );
-        // The sync block content (before alt) should have been flushed to history
         assert!(
             text.contains("sync content before alt"),
             "pre-alt sync content should be in history"

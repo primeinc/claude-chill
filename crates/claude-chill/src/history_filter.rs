@@ -37,6 +37,7 @@ impl HistoryFilter {
     /// If all parsed actions are safe (common case), returns a borrowed reference
     /// to the input bytes directly, avoiding allocation and preserving byte-level
     /// fidelity.
+    #[must_use]
     pub fn filter<'a>(&mut self, input: &'a [u8]) -> Cow<'a, [u8]> {
         let actions = self.parser.parse_as_vec(input);
 

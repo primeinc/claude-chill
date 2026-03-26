@@ -15,9 +15,6 @@ pub struct Config {
     pub history_lines: usize,
     pub lookback_key: String,
     pub auto_lookback_timeout_ms: u64,
-    #[allow(dead_code)]
-    #[serde(default)]
-    refresh_rate: Option<u64>,
 }
 
 impl Default for Config {
@@ -26,7 +23,6 @@ impl Default for Config {
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
             auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
-            refresh_rate: None,
         }
     }
 }
@@ -140,19 +136,13 @@ mod tests {
 
     #[test]
     fn test_unknown_fields_ignored() {
-        // serde(default) with deny_unknown_fields NOT set means unknown fields are OK
+        // serde(default) without deny_unknown_fields means unknown fields are accepted
         let toml_str = r#"
             history_lines = 50000
             some_future_field = true
         "#;
-        // This should parse without error since we don't deny unknown fields
-        let result: Result<Config, _> = toml::from_str(toml_str);
-        // toml crate may or may not reject unknown fields depending on config
-        // If it fails, that's acceptable — the important thing is the Config::load
-        // path handles it gracefully.
-        if let Ok(config) = result {
-            assert_eq!(config.history_lines, 50000);
-        }
+        let config: Config = toml::from_str(toml_str).expect("unknown fields should be accepted");
+        assert_eq!(config.history_lines, 50000);
     }
 
     #[test]
