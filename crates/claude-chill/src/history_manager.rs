@@ -252,4 +252,89 @@ mod tests {
         assert!(history_text(&hm).contains("after sync"));
         assert!(!parser.in_sync_block());
     }
+
+    #[test]
+    fn test_mode_sequences_filtered_inside_sync_blocks() {
+        let mut parser = SyncBlockParser::new();
+        let mut hm = HistoryManager::new(10000);
+
+        // A sync block containing mode-setting sequences that should be filtered
+        let mut input = Vec::new();
+        input.extend_from_slice(crate::escape_sequences::SYNC_START);
+        // Focus tracking + mouse mode + visible text + bracketed paste
+        input.extend_from_slice(b"\x1b[?1004h\x1b[?1000hvisible text\x1b[?2004h");
+        input.extend_from_slice(crate::escape_sequences::SYNC_END);
+
+        let mut segments = Vec::new();
+        parser.parse(&input, &mut segments);
+        for seg in segments.drain(..) {
+            hm.apply_segment(seg);
+        }
+
+        let text = history_text(&hm);
+        assert!(
+            text.contains("visible text"),
+            "visible text should be in history"
+        );
+        assert!(
+            !text.contains("1004"),
+            "focus tracking should be filtered out"
+        );
+        assert!(!text.contains("1000"), "mouse mode should be filtered out");
+        assert!(
+            !text.contains("2004"),
+            "bracketed paste should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_full_redraw_then_partial_then_full_redraw() {
+        let mut parser = SyncBlockParser::new();
+        let mut hm = HistoryManager::new(10000);
+
+        // Full redraw 1
+        let mut full1 = Vec::new();
+        full1.extend_from_slice(crate::escape_sequences::SYNC_START);
+        full1.extend_from_slice(crate::escape_sequences::CLEAR_SCREEN);
+        full1.extend_from_slice(crate::escape_sequences::CURSOR_HOME);
+        full1.extend_from_slice(b"Screen A\r\n");
+        full1.extend_from_slice(crate::escape_sequences::SYNC_END);
+
+        let mut segments = Vec::new();
+        parser.parse(&full1, &mut segments);
+        for seg in segments.drain(..) {
+            hm.apply_segment(seg);
+        }
+        assert!(history_text(&hm).contains("Screen A"));
+
+        // Partial update
+        let mut partial = Vec::new();
+        partial.extend_from_slice(crate::escape_sequences::SYNC_START);
+        partial.extend_from_slice(b"Added line\r\n");
+        partial.extend_from_slice(crate::escape_sequences::SYNC_END);
+
+        parser.parse(&partial, &mut segments);
+        for seg in segments.drain(..) {
+            hm.apply_segment(seg);
+        }
+        assert!(history_text(&hm).contains("Screen A"));
+        assert!(history_text(&hm).contains("Added line"));
+
+        // Full redraw 2 — should clear both Screen A and Added line
+        let mut full2 = Vec::new();
+        full2.extend_from_slice(crate::escape_sequences::SYNC_START);
+        full2.extend_from_slice(crate::escape_sequences::CLEAR_SCREEN);
+        full2.extend_from_slice(crate::escape_sequences::CURSOR_HOME);
+        full2.extend_from_slice(b"Screen B\r\n");
+        full2.extend_from_slice(crate::escape_sequences::SYNC_END);
+
+        parser.parse(&full2, &mut segments);
+        for seg in segments.drain(..) {
+            hm.apply_segment(seg);
+        }
+        let text = history_text(&hm);
+        assert!(!text.contains("Screen A"), "Screen A should be cleared");
+        assert!(!text.contains("Added line"), "Added line should be cleared");
+        assert!(text.contains("Screen B"), "Screen B should be present");
+    }
 }

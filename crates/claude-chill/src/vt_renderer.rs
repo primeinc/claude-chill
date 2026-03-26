@@ -346,4 +346,67 @@ mod tests {
         // After force_full_render, should produce a full render, not just a diff
         // (we can't easily distinguish, but we verify it doesn't crash)
     }
+
+    #[test]
+    fn test_full_render_then_diff_render_cycle() {
+        let mut renderer = VtRenderer::new(24, 80);
+
+        // Step 1: first render is always a full screen
+        renderer.process(b"\x1b[H\x1b[2J"); // clear screen + cursor home
+        renderer.process(b"Line 1\r\nLine 2\r\n");
+        renderer.mark_pending();
+        let first = renderer.render().unwrap().to_vec();
+        assert!(first.starts_with(SYNC_START));
+        assert!(first.ends_with(SYNC_END));
+        let first_content = &first[SYNC_START.len()..first.len() - SYNC_END.len()];
+        assert!(
+            !first_content.is_empty(),
+            "first render should have content"
+        );
+
+        // Step 2: second render should be a diff (smaller or equal)
+        renderer.process(b"\x1b[3;1HLine 3\r\n");
+        renderer.mark_pending();
+        let second = renderer.render().unwrap().to_vec();
+        assert!(second.starts_with(SYNC_START));
+        assert!(second.ends_with(SYNC_END));
+        // Diff render should generally be smaller than full render
+        // (though not guaranteed for all cases, it should be non-empty)
+        let second_content = &second[SYNC_START.len()..second.len() - SYNC_END.len()];
+        assert!(
+            !second_content.is_empty(),
+            "diff render should have content"
+        );
+    }
+
+    #[test]
+    fn test_resize() {
+        let mut renderer = VtRenderer::new(24, 80);
+        renderer.process(b"Hello");
+        renderer.mark_pending();
+        let _ = renderer.render();
+
+        renderer.resize(40, 120);
+        // After resize, force_full_render is called internally
+        renderer.process(b"After resize");
+        renderer.mark_pending();
+        let output = renderer.render();
+        assert!(output.is_some());
+    }
+
+    #[test]
+    fn test_time_until_render_delegates_correctly() {
+        let mut renderer = VtRenderer::new(24, 80);
+        renderer.mark_pending();
+
+        // Not in any special mode → should return Some duration
+        let result = renderer.time_until_render(false, false, false);
+        assert!(result.is_some());
+
+        // In lookback mode → None
+        assert!(renderer.time_until_render(true, false, false).is_none());
+
+        // In alt screen → None
+        assert!(renderer.time_until_render(false, true, false).is_none());
+    }
 }
