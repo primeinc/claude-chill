@@ -2,6 +2,8 @@ use crate::alt_screen::AltScreenTracker;
 use crate::escape_sequences::{
     CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
+#[cfg(test)]
+use crate::escape_sequences::ALT_SCREEN_ENTER;
 use crate::history_filter::HistoryFilter;
 use crate::kitty_tracker::KittyTracker;
 use crate::line_buffer::LineBuffer;
@@ -1478,5 +1480,73 @@ mod tests {
             "text after sync block should be in history"
         );
         assert!(!parser.in_sync_block(), "should be outside sync block");
+    }
+
+    #[test]
+    fn test_alt_screen_enter_during_sync_block() {
+        // Simulates the scenario from proxy.rs:375-398 where alt screen
+        // enter occurs in the middle of a sync block.
+        let mut parser = SyncBlockParser::new();
+        let mut history = LineBuffer::new(10000);
+        let mut filter = HistoryFilter::new();
+        let alt_tracker = AltScreenTracker::new();
+
+        // Seed history
+        history.push_bytes(CLEAR_SCREEN);
+        history.push_bytes(CURSOR_HOME);
+
+        // Preamble text
+        let mut segments = Vec::new();
+        parser.parse(b"initial output\r\n", &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+
+        // Build a chunk that starts a sync block, then has alt screen enter mid-block
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(SYNC_START);
+        chunk.extend_from_slice(b"sync content before alt ");
+        chunk.extend_from_slice(ALT_SCREEN_ENTER);
+        chunk.extend_from_slice(b"alt screen content");
+
+        // Find where alt screen enter is
+        let alt_pos = alt_tracker.find_enter(&chunk);
+        assert!(
+            alt_pos.is_some(),
+            "should find alt screen enter in the chunk"
+        );
+        let alt_pos = alt_pos.unwrap();
+
+        // Parse data up to alt screen enter point
+        let before_alt = &chunk[..alt_pos];
+        parser.parse(before_alt, &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+
+        // Flush the open sync block with remaining data (simulating what proxy does)
+        assert!(
+            parser.in_sync_block(),
+            "should be in sync block when alt screen hits"
+        );
+        let remaining = &chunk[alt_pos..];
+        let segment = parser.append_and_flush(remaining);
+        apply_segment(&mut history, &mut filter, segment);
+
+        assert!(
+            !parser.in_sync_block(),
+            "sync block should be flushed after alt screen"
+        );
+
+        let text = history_text(&history);
+        assert!(
+            text.contains("initial output"),
+            "preamble should be in history"
+        );
+        // The sync block content (before alt) should have been flushed to history
+        assert!(
+            text.contains("sync content before alt"),
+            "pre-alt sync content should be in history"
+        );
     }
 }
