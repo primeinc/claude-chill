@@ -118,4 +118,27 @@ mod tests {
         let sequence = b"\x1b[54;5u";
         assert_eq!(check(b"\x1b[54;5", b'x', sequence), SequenceMatch::None);
     }
+
+    #[test]
+    fn test_empty_buffer_empty_sequence() {
+        // Edge case: empty sequence should never match
+        assert_eq!(check(&[], b'a', &[]), SequenceMatch::None);
+    }
+
+    #[test]
+    fn test_two_byte_sequence() {
+        let sequence = &[0x1b, b'A'];
+        assert_eq!(check(&[], 0x1b, sequence), SequenceMatch::Partial);
+        assert_eq!(check(&[0x1b], b'A', sequence), SequenceMatch::Complete);
+        assert_eq!(check(&[0x1b], b'B', sequence), SequenceMatch::None);
+    }
+
+    #[test]
+    fn test_buffer_longer_than_sequence() {
+        // Buffer has more bytes than the sequence length — should still work
+        let sequence = &[0x1E];
+        let long_buffer = b"lots of random garbage here";
+        assert_eq!(check(long_buffer, 0x1E, sequence), SequenceMatch::Complete);
+        assert_eq!(check(long_buffer, b'x', sequence), SequenceMatch::None);
+    }
 }

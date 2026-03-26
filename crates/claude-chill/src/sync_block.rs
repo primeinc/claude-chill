@@ -336,4 +336,152 @@ mod tests {
         parser.parse(b"", &mut segments);
         assert_eq!(segments.len(), 0);
     }
+
+    #[test]
+    fn test_empty_sync_block() {
+        // Sync start immediately followed by sync end
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            OutputSegment::SyncBlock {
+                data,
+                is_full_redraw,
+            } => {
+                assert!(!is_full_redraw);
+                // Data should contain only the markers
+                assert!(data.starts_with(SYNC_START));
+                assert!(data.ends_with(SYNC_END));
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_sync_start_split_at_boundary() {
+        // Sync start marker split across two chunks
+        let mut parser = SyncBlockParser::new();
+        let split_point = SYNC_START.len() / 2;
+
+        let mut segments = Vec::new();
+        parser.parse(&SYNC_START[..split_point], &mut segments);
+        // First half of sync start looks like passthrough
+        assert!(!parser.in_sync_block());
+
+        // Second half completes the marker... but since memmem works on
+        // full patterns, a split marker won't be detected as a sync start.
+        // This is a known limitation: sync markers split across reads
+        // will be treated as passthrough. In practice, terminals write
+        // escape sequences atomically.
+        let mut chunk2 = Vec::new();
+        chunk2.extend_from_slice(&SYNC_START[split_point..]);
+        chunk2.extend_from_slice(b"content");
+        chunk2.extend_from_slice(SYNC_END);
+        parser.parse(&chunk2, &mut segments);
+        // The split marker won't be recognized — this documents the limitation
+    }
+
+    #[test]
+    fn test_only_cursor_home_not_full_redraw() {
+        // Cursor home without clear screen should NOT be full redraw
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(CURSOR_HOME);
+        input.extend_from_slice(b"content");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            OutputSegment::SyncBlock { is_full_redraw, .. } => {
+                assert!(!is_full_redraw, "cursor home alone is not full redraw");
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
+
+    #[test]
+    fn test_flush_if_in_sync_with_data() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"buffered data");
+        parser.parse(&input, &mut segments);
+        assert!(parser.in_sync_block());
+
+        let segment = parser.flush_if_in_sync();
+        assert!(segment.is_some());
+        assert!(!parser.in_sync_block());
+    }
+
+    #[test]
+    fn test_flush_if_not_in_sync() {
+        let mut parser = SyncBlockParser::new();
+        let segment = parser.flush_if_in_sync();
+        assert!(segment.is_none());
+    }
+
+    #[test]
+    fn test_consecutive_sync_blocks_no_gap() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"block1");
+        input.extend_from_slice(SYNC_END);
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"block2");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 2);
+        // Both should be sync blocks with no passthrough between them
+        for seg in &segments {
+            match seg {
+                OutputSegment::SyncBlock { .. } => {}
+                OutputSegment::PassThrough(_) => panic!("unexpected passthrough between blocks"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_reset_clears_buffer() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(b"some data in buffer");
+        parser.parse(&input, &mut segments);
+        assert!(parser.in_sync_block());
+
+        parser.reset();
+        assert!(!parser.in_sync_block());
+
+        // After reset, new sync block should start fresh
+        let mut input2 = Vec::new();
+        input2.extend_from_slice(SYNC_START);
+        input2.extend_from_slice(b"new data");
+        input2.extend_from_slice(SYNC_END);
+        parser.parse(&input2, &mut segments);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            OutputSegment::SyncBlock { data, .. } => {
+                let s = String::from_utf8_lossy(data);
+                assert!(s.contains("new data"));
+                assert!(!s.contains("some data"), "old buffer should not leak");
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
 }

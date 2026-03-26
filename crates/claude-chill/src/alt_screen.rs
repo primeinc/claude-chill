@@ -203,4 +203,65 @@ mod tests {
             ALT_SCREEN_EXIT_LEGACY.len()
         );
     }
+
+    #[test]
+    fn test_find_enter_at_start_of_data() {
+        let tracker = AltScreenTracker::new();
+        assert_eq!(tracker.find_enter(ALT_SCREEN_ENTER), Some(0));
+    }
+
+    #[test]
+    fn test_find_exit_at_start_of_data() {
+        let tracker = AltScreenTracker::new();
+        assert_eq!(tracker.find_exit(ALT_SCREEN_EXIT), Some(0));
+    }
+
+    #[test]
+    fn test_find_enter_with_trailing_data() {
+        let tracker = AltScreenTracker::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(ALT_SCREEN_ENTER);
+        data.extend_from_slice(b"content after enter");
+        assert_eq!(tracker.find_enter(&data), Some(0));
+    }
+
+    #[test]
+    fn test_find_exit_with_leading_and_trailing_data() {
+        let tracker = AltScreenTracker::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"prefix data here ");
+        let pos = data.len();
+        data.extend_from_slice(ALT_SCREEN_EXIT);
+        data.extend_from_slice(b" suffix");
+        assert_eq!(tracker.find_exit(&data), Some(pos));
+    }
+
+    #[test]
+    fn test_enter_len_defaults_to_legacy_for_unknown() {
+        let tracker = AltScreenTracker::new();
+        // If data doesn't start with the modern sequence, enter_len returns legacy length
+        assert_eq!(tracker.enter_len(b"garbage"), ALT_SCREEN_ENTER_LEGACY.len());
+    }
+
+    #[test]
+    fn test_multiple_transitions() {
+        let mut tracker = AltScreenTracker::new();
+        assert!(!tracker.in_alternate_screen());
+        tracker.set_alternate_screen(true);
+        assert!(tracker.in_alternate_screen());
+        tracker.set_alternate_screen(true); // idempotent
+        assert!(tracker.in_alternate_screen());
+        tracker.set_alternate_screen(false);
+        assert!(!tracker.in_alternate_screen());
+        tracker.set_alternate_screen(false); // idempotent
+        assert!(!tracker.in_alternate_screen());
+    }
+
+    #[test]
+    fn test_find_partial_sequence_not_matched() {
+        let tracker = AltScreenTracker::new();
+        // A partial alt screen sequence should not match
+        let partial = &ALT_SCREEN_ENTER[..ALT_SCREEN_ENTER.len() - 1];
+        assert_eq!(tracker.find_enter(partial), None);
+    }
 }
