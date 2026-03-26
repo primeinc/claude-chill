@@ -1,3 +1,5 @@
+//! Line-oriented ring buffer for terminal output history.
+
 use memchr::memchr;
 use std::collections::VecDeque;
 

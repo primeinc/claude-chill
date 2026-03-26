@@ -1,3 +1,5 @@
+//! Synchronized output block parser for detecting and buffering DEC mode 2026 blocks.
+
 use crate::escape_sequences::{
     CLEAR_SCREEN, CURSOR_HOME, SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };

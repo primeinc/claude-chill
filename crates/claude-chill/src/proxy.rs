@@ -1,3 +1,5 @@
+//! PTY proxy: event loop, VT rendering, history management, and lookback mode.
+
 use crate::alt_screen::AltScreenTracker;
 #[cfg(test)]
 use crate::escape_sequences::ALT_SCREEN_ENTER;

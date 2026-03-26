@@ -1,3 +1,5 @@
+//! Kitty keyboard protocol state tracking and terminal detection.
+
 use log::debug;
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};

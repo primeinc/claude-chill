@@ -1,3 +1,5 @@
+//! Parser for human-readable key strings like `"[ctrl][shift][f5]"`.
+
 use std::fmt;
 
 /// Error returned when a key string like `"[ctrl][x]"` cannot be parsed.

@@ -1,3 +1,5 @@
+//! Alternate screen buffer state tracking (modern and legacy DEC modes).
+
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
 };
