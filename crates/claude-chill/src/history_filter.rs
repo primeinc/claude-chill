@@ -866,4 +866,15 @@ mod tests {
             "slow path should return Cow::Owned, got Cow::Borrowed"
         );
     }
+
+    #[test]
+    fn test_empty_input() {
+        let mut filter = HistoryFilter::new();
+        let output = filter.filter(b"");
+        assert!(output.is_empty(), "empty input should produce empty output");
+        assert!(
+            matches!(output, Cow::Borrowed(_)),
+            "empty input should return Cow::Borrowed"
+        );
+    }
 }
