@@ -53,6 +53,7 @@ impl SyncBlockParser {
 
     /// If currently in a sync block, flush it as a completed sync block.
     /// Returns the segment if there was buffered data.
+    #[must_use]
     pub fn flush_if_in_sync(&mut self) -> Option<OutputSegment<'static>> {
         if !self.in_sync_block || self.sync_buffer.is_empty() {
             return None;
