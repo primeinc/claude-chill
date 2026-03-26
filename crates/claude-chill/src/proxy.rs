@@ -431,7 +431,7 @@ impl Proxy {
     /// cause the terminal to respond when replayed.
     fn push_to_history(&mut self, data: &[u8]) {
         let filtered = self.history_filter.filter(data);
-        self.history.push_bytes(&filtered);
+        self.history.push_bytes(filtered.as_ref());
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
@@ -1043,7 +1043,7 @@ mod tests {
 
         let data = b"hello world\n";
         let filtered = history_filter.filter(data);
-        history.push_bytes(&filtered);
+        history.push_bytes(filtered.as_ref());
 
         let mut output = Vec::new();
         history.append_all(&mut output);
@@ -1231,7 +1231,7 @@ mod tests {
         match segment {
             OutputSegment::PassThrough(data) => {
                 let filtered = filter.filter(data);
-                history.push_bytes(&filtered);
+                history.push_bytes(filtered.as_ref());
             }
             OutputSegment::SyncBlock {
                 data,
@@ -1243,7 +1243,7 @@ mod tests {
                     history.push_bytes(CURSOR_HOME);
                 }
                 let filtered = filter.filter(&data);
-                history.push_bytes(&filtered);
+                history.push_bytes(filtered.as_ref());
             }
         }
     }

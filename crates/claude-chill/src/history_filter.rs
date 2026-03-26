@@ -7,6 +7,7 @@
 //! IMPORTANT: Every enum variant must be explicitly classified.
 //! No catch-all fallbacks - we must consciously decide on each case.
 
+use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 use termwiz::escape::Action;
 use termwiz::escape::csi::CSI;
@@ -33,18 +34,18 @@ impl HistoryFilter {
 
     /// Filter bytes, returning only safe sequences for history.
     ///
-    /// If all parsed actions are safe (common case), returns the input bytes
-    /// directly to avoid the parse→Display re-encoding overhead and preserve
-    /// byte-level fidelity.
-    pub fn filter(&mut self, input: &[u8]) -> Vec<u8> {
+    /// If all parsed actions are safe (common case), returns a borrowed reference
+    /// to the input bytes directly, avoiding allocation and preserving byte-level
+    /// fidelity.
+    pub fn filter<'a>(&mut self, input: &'a [u8]) -> Cow<'a, [u8]> {
         let actions = self.parser.parse_as_vec(input);
 
         // Fast path: if everything is safe, return input bytes directly.
         // This avoids the Display re-encoding which can alter byte-level output
-        // (e.g. combined SGR params, elided default cursor params).
-        let all_safe = actions.iter().all(is_safe_for_history);
-        if all_safe {
-            return input.to_vec();
+        // (e.g. combined SGR params, elided default cursor params) and skips
+        // the Vec allocation entirely.
+        if actions.iter().all(is_safe_for_history) {
+            return Cow::Borrowed(input);
         }
 
         // Slow path: some actions are blacklisted, re-encode only the safe ones.
@@ -54,7 +55,7 @@ impl HistoryFilter {
                 let _ = write!(output, "{action}");
             }
         }
-        output.into_bytes()
+        Cow::Owned(output.into_bytes())
     }
 }
 
@@ -498,7 +499,7 @@ mod tests {
     fn test_plain_text_passes() {
         let mut filter = HistoryFilter::new();
         let output = filter.filter(b"Hello, World!");
-        assert_eq!(output, b"Hello, World!");
+        assert_eq!(output.as_ref(), b"Hello, World!");
     }
 
     #[test]
@@ -796,7 +797,8 @@ mod tests {
         let input = b"Hello, World!";
         let output = filter.filter(input);
         assert_eq!(
-            output, input,
+            output.as_ref(),
+            input,
             "fast path: plain text should return exact bytes"
         );
     }
