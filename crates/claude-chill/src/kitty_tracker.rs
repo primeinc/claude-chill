@@ -80,6 +80,7 @@ impl KittyTracker {
 
 /// Pure decision: should we skip the Kitty keyboard protocol DA query?
 /// Returns true if the terminal is known not to support Kitty protocol.
+#[must_use]
 pub fn should_skip_kitty_query(term_program: Option<&str>, term: Option<&str>) -> bool {
     if let Some(tp) = term_program {
         let tp_lower = tp.to_ascii_lowercase();
@@ -105,6 +106,7 @@ pub fn should_skip_kitty_query(term_program: Option<&str>, term: Option<&str>) -
 /// Checks environment variables first to avoid a 500ms DA query on terminals
 /// known not to support Kitty protocol. Skips the query entirely if stdin
 /// is not a TTY.
+#[must_use]
 pub fn detect() -> KittyTracker {
     // Skip the terminal query entirely if stdin isn't a TTY (e.g. piped input)
     if !isatty(std::io::stdin()).unwrap_or(false) {

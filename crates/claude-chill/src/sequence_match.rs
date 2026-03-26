@@ -14,6 +14,7 @@ pub enum SequenceMatch {
 ///
 /// The buffer is windowed to at most `sequence.len() - 1` bytes (the last N-1 bytes),
 /// so this works correctly even if the buffer contains earlier unrelated bytes.
+#[must_use]
 pub fn check(buffer: &[u8], byte: u8, sequence: &[u8]) -> SequenceMatch {
     if sequence.is_empty() {
         return SequenceMatch::None;
