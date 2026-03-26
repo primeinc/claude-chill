@@ -396,12 +396,12 @@ impl Proxy {
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        if let Some(Duration::ZERO) = self.renderer.time_until_render(
+        if let Some(bytes) = self.renderer.flush_if_ready(
             self.in_lookback_mode,
             self.alt_screen.in_alternate_screen(),
             self.sync_parser.in_sync_block(),
         ) {
-            self.render_vt_screen(stdout_fd)?;
+            write_to_terminal(&mut self.kitty_tracker, stdout_fd, bytes)?;
         }
         Ok(())
     }
