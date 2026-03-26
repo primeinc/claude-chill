@@ -90,6 +90,20 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
+        anyhow::ensure!(
+            !config.lookback_sequence_legacy.is_empty(),
+            "lookback_sequence_legacy must not be empty"
+        );
+        anyhow::ensure!(
+            !config.lookback_sequence_kitty.is_empty(),
+            "lookback_sequence_kitty must not be empty"
+        );
+        anyhow::ensure!(
+            config.lookback_sequence_legacy.len() <= 16
+                && config.lookback_sequence_kitty.len() <= 16,
+            "lookback sequences must be at most 16 bytes"
+        );
+
         let winsize = get_terminal_size()?;
         let pty = openpty(&winsize, None).context("openpty failed")?;
 
