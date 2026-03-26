@@ -42,6 +42,3 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
 ] }
-
-[dev-dependencies]
-portable-pty = "0.9.0"
