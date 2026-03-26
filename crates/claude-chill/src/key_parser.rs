@@ -66,11 +66,13 @@ pub struct KeyCombination {
 
 impl KeyCombination {
     /// Produce the legacy terminal escape sequence for this key combination.
+    #[must_use]
     pub fn to_escape_sequence(&self) -> Vec<u8> {
         key_to_escape_sequence(&self.code, &self.modifiers)
     }
 
     /// Produce the Kitty keyboard protocol sequence, or `None` if unsupported.
+    #[must_use]
     pub fn to_kitty_sequence(&self) -> Option<Vec<u8>> {
         let codepoint = match &self.code {
             KeyCode::Char(c) => *c as u32,
