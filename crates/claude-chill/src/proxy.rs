@@ -105,6 +105,33 @@ pub struct Proxy {
 
 /// Detect Kitty keyboard protocol support and return a configured KittyTracker.
 fn detect_kitty_support() -> KittyTracker {
+    // Skip the terminal query entirely if stdin isn't a TTY (e.g. piped input)
+    if !isatty(io::stdin()).unwrap_or(false) {
+        debug!("Kitty detection skipped: stdin is not a TTY");
+        return KittyTracker::new(false, 0);
+    }
+
+    // Check TERM_PROGRAM for terminals known not to support Kitty protocol.
+    // This avoids the 500ms query timeout on terminals that will never respond.
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
+        let tp = term_program.to_ascii_lowercase();
+        if matches!(
+            tp.as_str(),
+            "apple_terminal" | "terminal.app" | "iterm.app" | "iterm2" | "hyper" | "terminus"
+        ) {
+            debug!("Kitty detection skipped: TERM_PROGRAM={term_program} (known non-Kitty)");
+            return KittyTracker::new(false, 0);
+        }
+    }
+
+    // Also skip for TERM values that indicate a very basic terminal
+    if let Ok(term) = std::env::var("TERM") {
+        if matches!(term.as_str(), "dumb" | "linux" | "vt100" | "vt220") {
+            debug!("Kitty detection skipped: TERM={term} (basic terminal)");
+            return KittyTracker::new(false, 0);
+        }
+    }
+
     let (supported, initial_flags) = query_kitty_support();
     let initial_stack = if initial_flags > 0 { 1 } else { 0 };
     KittyTracker::new(supported, initial_stack)
@@ -203,6 +230,11 @@ impl Proxy {
 
         let slave_fd = pty.slave.as_raw_fd();
 
+        // SAFETY: pre_exec runs between fork and exec in the child process.
+        // slave_fd is a valid file descriptor obtained from openpty above.
+        // We call setsid/TIOCSCTTY to establish a new session with the PTY as
+        // controlling terminal, dup2 to wire stdin/stdout/stderr to the slave,
+        // and close the original fd if it's not one of 0/1/2.
         let child = unsafe {
             Command::new(command)
                 .args(args)
@@ -291,6 +323,9 @@ impl Proxy {
                 self.forward_signal(Signal::SIGTERM);
             }
 
+            // SAFETY: pty_master is an OwnedFd that outlives the poll call.
+            // stdin_fd is io::stdin() which lives for the duration of the loop.
+            // The BorrowedFd references are only used within this loop iteration.
             let master_fd = unsafe { BorrowedFd::borrow_raw(self.pty_master.as_raw_fd()) };
             let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
 
@@ -604,8 +639,10 @@ impl Proxy {
 
         self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
         self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
-        self.kitty_tracker.process(&self.output_buffer);
-        write_all(stdout_fd, &self.output_buffer)?;
+        // Take the buffer temporarily to avoid borrow conflict with write_to_terminal
+        let buf = std::mem::take(&mut self.output_buffer);
+        self.write_to_terminal(stdout_fd, &buf)?;
+        self.output_buffer = buf;
 
         // Force full VT render on next output since terminal now shows history
         self.vt_prev_screen = None;
@@ -655,7 +692,7 @@ impl Proxy {
                     if self.in_lookback_mode {
                         self.exit_lookback_mode(stdout_fd)?;
                     } else {
-                        self.enter_lookback_mode()?;
+                        self.enter_lookback_mode(stdout_fd)?;
                     }
                     continue;
                 }
@@ -675,7 +712,7 @@ impl Proxy {
         Ok(())
     }
 
-    fn enter_lookback_mode(&mut self) -> Result<()> {
+    fn enter_lookback_mode<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
         debug!(
             "enter_lookback_mode: history_bytes={} lines={}",
             self.history.total_bytes(),
@@ -692,16 +729,18 @@ impl Proxy {
             self.output_buffer.len()
         );
 
-        let stdout_fd = io::stdout();
-        write_all(&stdout_fd, CLEAR_SCREEN)?;
-        write_all(&stdout_fd, CURSOR_HOME)?;
-        write_all(&stdout_fd, &self.output_buffer)?;
+        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
+        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
+        // Take the buffer temporarily to avoid borrow conflict with write_to_terminal
+        let buf = std::mem::take(&mut self.output_buffer);
+        self.write_to_terminal(stdout_fd, &buf)?;
+        self.output_buffer = buf;
 
         let exit_msg = format!(
             "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
             self.config.lookback_key
         );
-        write_all(&stdout_fd, exit_msg.as_bytes())?;
+        write_all(stdout_fd, exit_msg.as_bytes())?;
 
         Ok(())
     }
@@ -748,7 +787,9 @@ impl Proxy {
                 .set_size(winsize.ws_row, winsize.ws_col);
             // Force full render on next frame since size changed
             self.vt_prev_screen = None;
-            // Forward to child process
+            // SAFETY: pty_master is a valid fd (OwnedFd), winsize is a valid
+            // Winsize struct just obtained from get_terminal_size. TIOCSWINSZ
+            // reads the struct and applies the size to the PTY.
             let ret = unsafe {
                 libc::ioctl(
                     self.pty_master.as_raw_fd(),
@@ -788,6 +829,9 @@ impl Drop for Proxy {
 }
 
 fn get_terminal_size() -> Result<Winsize> {
+    // SAFETY: Winsize is a plain C struct with no padding requirements;
+    // zeroed memory is a valid initial state. TIOCGWINSZ writes the
+    // terminal dimensions into ws; stdout is a valid fd.
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
     let ret = unsafe {
         libc::ioctl(
@@ -833,6 +877,8 @@ fn setup_signal_handler(signal: Signal, handler: extern "C" fn(libc::c_int)) -> 
         SaFlags::SA_RESTART,
         SigSet::empty(),
     );
+    // SAFETY: The signal handler only performs atomic stores, which is
+    // async-signal-safe. The SigAction is correctly constructed above.
     unsafe { sigaction(signal, &action) }.context(format!("sigaction {signal:?} failed"))?;
     Ok(())
 }
