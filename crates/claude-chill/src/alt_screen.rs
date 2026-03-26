@@ -1,4 +1,9 @@
 //! Alternate screen buffer state tracking (modern and legacy DEC modes).
+//!
+//! Uses `memchr::memmem::Finder` for fast byte-level pattern matching.
+//! Note: sequences split across read boundaries will not be detected.
+//! In practice, terminals write escape sequences atomically so this
+//! is not an issue.
 
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
