@@ -32,16 +32,28 @@ impl HistoryFilter {
     }
 
     /// Filter bytes, returning only safe sequences for history.
+    ///
+    /// If all parsed actions are safe (common case), returns the input bytes
+    /// directly to avoid the parse→Display re-encoding overhead and preserve
+    /// byte-level fidelity.
     pub fn filter(&mut self, input: &[u8]) -> Vec<u8> {
         let actions = self.parser.parse_as_vec(input);
-        let mut output = String::with_capacity(input.len());
 
+        // Fast path: if everything is safe, return input bytes directly.
+        // This avoids the Display re-encoding which can alter byte-level output
+        // (e.g. combined SGR params, elided default cursor params).
+        let all_safe = actions.iter().all(is_safe_for_history);
+        if all_safe {
+            return input.to_vec();
+        }
+
+        // Slow path: some actions are blacklisted, re-encode only the safe ones.
+        let mut output = String::with_capacity(input.len());
         for action in actions {
             if is_safe_for_history(&action) {
                 let _ = write!(output, "{action}");
             }
         }
-
         output.into_bytes()
     }
 }
