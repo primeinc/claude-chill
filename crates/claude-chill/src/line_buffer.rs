@@ -227,4 +227,67 @@ mod tests {
             "CRLF must be preserved in last_n"
         );
     }
+
+    #[test]
+    fn test_large_input_correctness() {
+        // Simulate a large sync block (100K lines) to verify memchr-based
+        // push_bytes produces identical results to byte-at-a-time push_byte.
+        let max_lines = 1000;
+        let mut buf_bulk = LineBuffer::new(max_lines);
+        let mut buf_byte = LineBuffer::new(max_lines);
+
+        // Build a large input: 5000 lines of varying length
+        let mut input = Vec::new();
+        for i in 0..5000 {
+            let line = format!("line {i}: {}\n", "x".repeat(i % 80));
+            input.extend_from_slice(line.as_bytes());
+        }
+
+        // Push via bulk method
+        buf_bulk.push_bytes(&input);
+
+        // Push via byte-at-a-time method
+        for &byte in &input {
+            buf_byte.push_byte(byte);
+        }
+
+        assert_eq!(buf_bulk.line_count(), buf_byte.line_count());
+        assert_eq!(buf_bulk.total_bytes(), buf_byte.total_bytes());
+
+        let mut out_bulk = Vec::new();
+        let mut out_byte = Vec::new();
+        buf_bulk.append_all(&mut out_bulk);
+        buf_byte.append_all(&mut out_byte);
+        assert_eq!(
+            out_bulk, out_byte,
+            "bulk and byte-at-a-time must produce identical output"
+        );
+    }
+
+    #[test]
+    fn test_push_bytes_empty_input() {
+        let mut buf = LineBuffer::new(10);
+        buf.push_bytes(b"existing\n");
+        buf.push_bytes(b"");
+        assert_eq!(buf.line_count(), 1);
+        assert_eq!(get_all(&buf), b"existing\n");
+    }
+
+    #[test]
+    fn test_push_bytes_only_newlines() {
+        let mut buf = LineBuffer::new(10);
+        buf.push_bytes(b"\n\n\n");
+        assert_eq!(buf.line_count(), 3);
+        assert_eq!(get_all(&buf), b"\n\n\n");
+    }
+
+    #[test]
+    fn test_push_bytes_consecutive_calls() {
+        let mut buf = LineBuffer::new(10);
+        buf.push_bytes(b"hel");
+        buf.push_bytes(b"lo\nwor");
+        buf.push_bytes(b"ld\n");
+        assert_eq!(buf.line_count(), 2);
+        assert_eq!(get_all(&buf), b"hello\nworld\n");
+    }
 }

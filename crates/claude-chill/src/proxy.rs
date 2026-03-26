@@ -63,28 +63,41 @@ const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
 
 pub struct Proxy {
+    // Process & terminal
     config: ProxyConfig,
-    lookback_sequence_legacy: Vec<u8>,
-    lookback_sequence_kitty: Vec<u8>,
     pty_master: OwnedFd,
     child: Child,
     original_termios: Option<Termios>,
-    history: LineBuffer,
-    history_filter: HistoryFilter,
+
+    // VT emulation
     vt_parser: vt100::Parser,
     vt_prev_screen: Option<vt100::Screen>,
+    vt_render_pending: bool,
+    sync_parser: SyncBlockParser,
+
+    // History & filtering
+    history: LineBuffer,
+    history_filter: HistoryFilter,
+
+    // Mode tracking
+    in_lookback_mode: bool,
+    alt_screen: AltScreenTracker,
+    kitty_tracker: KittyTracker,
+
+    // Lookback input matching (stack-copied from config to avoid borrow conflicts)
+    lookback_sequence_legacy: Vec<u8>,
+    lookback_sequence_kitty: Vec<u8>,
+    lookback_input_buffer: Vec<u8>,
+    lookback_cache: Vec<u8>,
+
+    // Timing
     last_output_time: Option<Instant>,
     last_render_time: Option<Instant>,
     last_stdin_time: Option<Instant>,
     last_auto_lookback_time: Option<Instant>,
     auto_lookback_timeout: Duration,
-    sync_parser: SyncBlockParser,
-    in_lookback_mode: bool,
-    alt_screen: AltScreenTracker,
-    kitty_tracker: KittyTracker,
-    vt_render_pending: bool,
-    lookback_cache: Vec<u8>,
-    lookback_input_buffer: Vec<u8>,
+
+    // Reusable write buffer (avoids per-render allocation)
     output_buffer: Vec<u8>,
 }
 
@@ -1323,5 +1336,147 @@ mod tests {
         assert!(!text.contains("1004"));
         assert!(!text.contains("1000"));
         assert!(!text.contains("2004"));
+    }
+
+    // ================================================================
+    // Simulated output flow: sync parser + history integration
+    // ================================================================
+
+    /// Helper: simulate apply_segment_to_history logic from Proxy
+    fn apply_segment(
+        history: &mut LineBuffer,
+        filter: &mut HistoryFilter,
+        segment: OutputSegment<'_>,
+    ) {
+        match segment {
+            OutputSegment::PassThrough(data) => {
+                let filtered = filter.filter(data);
+                history.push_bytes(&filtered);
+            }
+            OutputSegment::SyncBlock {
+                data,
+                is_full_redraw,
+            } => {
+                if is_full_redraw {
+                    history.clear();
+                    history.push_bytes(CLEAR_SCREEN);
+                    history.push_bytes(CURSOR_HOME);
+                }
+                let filtered = filter.filter(&data);
+                history.push_bytes(&filtered);
+            }
+        }
+    }
+
+    fn history_text(history: &LineBuffer) -> String {
+        let mut output = Vec::new();
+        history.append_all(&mut output);
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[test]
+    fn test_realistic_output_flow() {
+        let mut parser = SyncBlockParser::new();
+        let mut history = LineBuffer::new(10000);
+        let mut filter = HistoryFilter::new();
+
+        // Seed history like Proxy::spawn does
+        history.push_bytes(CLEAR_SCREEN);
+        history.push_bytes(CURSOR_HOME);
+
+        // Step 1: passthrough text (initial shell output)
+        let mut segments = Vec::new();
+        parser.parse(b"$ claude\r\nStarting...\r\n", &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+        let text = history_text(&history);
+        assert!(text.contains("Starting..."), "passthrough text in history");
+
+        // Step 2: partial sync block (update without full redraw)
+        let mut partial_sync = Vec::new();
+        partial_sync.extend_from_slice(SYNC_START);
+        partial_sync.extend_from_slice(b"\x1b[10;1HThinking...");
+        partial_sync.extend_from_slice(SYNC_END);
+        parser.parse(&partial_sync, &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+        let text = history_text(&history);
+        assert!(
+            text.contains("Starting..."),
+            "old text preserved after partial sync"
+        );
+        assert!(
+            text.contains("Thinking..."),
+            "new text added after partial sync"
+        );
+
+        // Step 3: full redraw sync block (clears history)
+        let mut full_redraw = Vec::new();
+        full_redraw.extend_from_slice(SYNC_START);
+        full_redraw.extend_from_slice(CLEAR_SCREEN);
+        full_redraw.extend_from_slice(CURSOR_HOME);
+        full_redraw.extend_from_slice(b"Fresh screen content\r\n");
+        full_redraw.extend_from_slice(SYNC_END);
+        parser.parse(&full_redraw, &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+        let text = history_text(&history);
+        assert!(
+            !text.contains("Starting..."),
+            "old text cleared after full redraw"
+        );
+        assert!(
+            !text.contains("Thinking..."),
+            "partial sync text cleared after full redraw"
+        );
+        assert!(
+            text.contains("Fresh screen content"),
+            "new content present after full redraw"
+        );
+    }
+
+    #[test]
+    fn test_split_sync_block_across_chunks_with_history() {
+        let mut parser = SyncBlockParser::new();
+        let mut history = LineBuffer::new(10000);
+        let mut filter = HistoryFilter::new();
+
+        // Chunk 1: start of sync block
+        let mut chunk1 = Vec::new();
+        chunk1.extend_from_slice(b"preamble\r\n");
+        chunk1.extend_from_slice(SYNC_START);
+        chunk1.extend_from_slice(b"partial con");
+
+        let mut segments = Vec::new();
+        parser.parse(&chunk1, &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+        let text = history_text(&history);
+        assert!(
+            text.contains("preamble"),
+            "passthrough before sync should be in history"
+        );
+        assert!(parser.in_sync_block(), "should be mid-sync-block");
+
+        // Chunk 2: end of sync block
+        let mut chunk2 = Vec::new();
+        chunk2.extend_from_slice(b"tent here");
+        chunk2.extend_from_slice(SYNC_END);
+        chunk2.extend_from_slice(b"\r\nafter sync\r\n");
+
+        parser.parse(&chunk2, &mut segments);
+        for seg in segments.drain(..) {
+            apply_segment(&mut history, &mut filter, seg);
+        }
+        let text = history_text(&history);
+        assert!(
+            text.contains("after sync"),
+            "text after sync block should be in history"
+        );
+        assert!(!parser.in_sync_block(), "should be outside sync block");
     }
 }
