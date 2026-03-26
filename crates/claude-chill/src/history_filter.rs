@@ -24,6 +24,7 @@ impl Default for HistoryFilter {
 }
 
 impl HistoryFilter {
+    /// Create a new filter with a fresh termwiz parser.
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),

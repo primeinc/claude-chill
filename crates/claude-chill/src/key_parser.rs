@@ -1,5 +1,6 @@
 use std::fmt;
 
+/// Error returned when a key string like `"[ctrl][x]"` cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseKeyError {
     pub raw: String,
@@ -23,6 +24,7 @@ impl fmt::Display for ParseKeyError {
 
 impl std::error::Error for ParseKeyError {}
 
+/// Modifier keys (ctrl, shift, alt) for a key combination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Modifiers {
     pub ctrl: bool,
@@ -30,6 +32,7 @@ pub struct Modifiers {
     pub alt: bool,
 }
 
+/// The base key in a key combination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyCode {
     Char(char),
@@ -51,6 +54,8 @@ pub enum KeyCode {
     Space,
 }
 
+/// A parsed key combination (e.g. Ctrl+Shift+F5) with methods to produce
+/// legacy and Kitty keyboard protocol escape sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyCombination {
     pub code: KeyCode,
@@ -120,6 +125,7 @@ impl fmt::Display for KeyCombination {
     }
 }
 
+/// Parse a key string like `"[ctrl][shift][f5]"` into a [`KeyCombination`].
 pub fn parse(raw: &str) -> Result<KeyCombination, ParseKeyError> {
     let raw_lower = raw.to_ascii_lowercase();
     let mut modifiers = Modifiers::default();
