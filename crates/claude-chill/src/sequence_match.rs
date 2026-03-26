@@ -30,23 +30,18 @@ pub fn check(buffer: &[u8], byte: u8, sequence: &[u8]) -> SequenceMatch {
     };
     let prefix = &buffer[buf_start..];
 
-    // Check if prefix + byte matches the full sequence
-    if prefix.len() + 1 == sequence.len()
+    let candidate_len = prefix.len() + 1;
+    if candidate_len <= sequence.len()
         && sequence[..prefix.len()] == *prefix
         && sequence[prefix.len()] == byte
     {
-        SequenceMatch::Complete
-    } else {
-        // Check partial: does prefix + byte form a prefix of the sequence?
-        let candidate_len = prefix.len() + 1;
-        if candidate_len <= sequence.len()
-            && sequence[..prefix.len()] == *prefix
-            && sequence[prefix.len()] == byte
-        {
-            SequenceMatch::Partial
+        if candidate_len == sequence.len() {
+            SequenceMatch::Complete
         } else {
-            SequenceMatch::None
+            SequenceMatch::Partial
         }
+    } else {
+        SequenceMatch::None
     }
 }
 
