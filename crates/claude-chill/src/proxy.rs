@@ -503,6 +503,10 @@ impl Proxy {
     }
 
     fn dump_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        debug_assert!(
+            !self.in_lookback_mode,
+            "dump_history called while in lookback mode"
+        );
         debug!(
             "dump_history: history_bytes={} lines={}",
             self.history.total_bytes(),
@@ -598,6 +602,14 @@ impl Proxy {
     }
 
     fn enter_lookback_mode<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        debug_assert!(
+            !self.in_lookback_mode,
+            "enter_lookback_mode called while already in lookback mode"
+        );
+        debug_assert!(
+            !self.alt_screen.in_alternate_screen(),
+            "enter_lookback_mode called while in alt screen"
+        );
         debug!(
             "enter_lookback_mode: history_bytes={} lines={}",
             self.history.total_bytes(),
@@ -631,6 +643,10 @@ impl Proxy {
     }
 
     fn exit_lookback_mode<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        debug_assert!(
+            self.in_lookback_mode,
+            "exit_lookback_mode called while not in lookback mode"
+        );
         debug!(
             "exit_lookback_mode: cached_len={}",
             self.lookback_cache.len()

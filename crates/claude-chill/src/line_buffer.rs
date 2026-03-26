@@ -10,8 +10,10 @@ pub struct LineBuffer {
 
 impl LineBuffer {
     pub fn new(max_lines: usize) -> Self {
+        // Pre-allocate for typical initial growth; caps at max_lines.
+        let initial_capacity = max_lines.min(1024);
         Self {
-            lines: VecDeque::new(),
+            lines: VecDeque::with_capacity(initial_capacity),
             current_line: Vec::new(),
             max_lines,
             cached_bytes: 0,
