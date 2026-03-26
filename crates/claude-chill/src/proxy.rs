@@ -664,6 +664,7 @@ impl Drop for Proxy {
 
 /// Pure decision: should auto-lookback trigger?
 /// Returns true if all conditions for auto-lookback are met.
+#[must_use]
 fn should_auto_lookback(
     timeout: Duration,
     in_lookback_mode: bool,
