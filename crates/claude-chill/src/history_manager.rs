@@ -337,4 +337,71 @@ mod tests {
         assert!(!text.contains("Added line"), "Added line should be cleared");
         assert!(text.contains("Screen B"), "Screen B should be present");
     }
+
+    #[test]
+    fn test_stress_many_sync_blocks() {
+        // Simulate a realistic Claude Code session: hundreds of sync blocks
+        // interleaved with passthrough data.
+        let mut parser = SyncBlockParser::new();
+        let mut hm = HistoryManager::new(10000);
+        let mut segments = Vec::new();
+
+        for i in 0..200 {
+            // Passthrough text
+            let text = format!("output line {i}\r\n");
+            parser.parse(text.as_bytes(), &mut segments);
+            for seg in segments.drain(..) {
+                hm.apply_segment(seg);
+            }
+
+            // Sync block (every 10th is a full redraw)
+            let mut block = Vec::new();
+            block.extend_from_slice(crate::escape_sequences::SYNC_START);
+            if i % 10 == 0 {
+                block.extend_from_slice(crate::escape_sequences::CLEAR_SCREEN);
+                block.extend_from_slice(crate::escape_sequences::CURSOR_HOME);
+            }
+            block.extend_from_slice(format!("sync {i}\r\n").as_bytes());
+            block.extend_from_slice(crate::escape_sequences::SYNC_END);
+            parser.parse(&block, &mut segments);
+            for seg in segments.drain(..) {
+                hm.apply_segment(seg);
+            }
+        }
+
+        // After 200 iterations with redraws every 10, last redraw was at i=190
+        let text = history_text(&hm);
+        // Should contain content from after last full redraw (i >= 190)
+        assert!(text.contains("sync 199"), "latest sync should be present");
+        // Content from before last full redraw should be gone
+        assert!(
+            !text.contains("output line 189"),
+            "pre-redraw content should be cleared"
+        );
+        // History line count should be bounded
+        assert!(
+            hm.line_count() < 10000,
+            "history should not grow unboundedly"
+        );
+    }
+
+    #[test]
+    fn test_empty_input_handling() {
+        let mut hm = HistoryManager::new(1000);
+
+        // Push empty data
+        hm.push(b"");
+        // Apply empty passthrough
+        hm.apply_segment(OutputSegment::PassThrough(b""));
+        // Apply empty sync block
+        hm.apply_segment(OutputSegment::SyncBlock {
+            data: Vec::new(),
+            is_full_redraw: false,
+        });
+
+        // Should still have the initial clear screen seed
+        let mut output = Vec::new();
+        hm.append_all(&mut output);
+        assert!(!output.is_empty(), "should have initial seed data");
+    }
 }
