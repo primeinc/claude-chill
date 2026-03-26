@@ -292,4 +292,31 @@ mod tests {
         let partial = &ALT_SCREEN_ENTER[..ALT_SCREEN_ENTER.len() - 1];
         assert_eq!(tracker.find_enter(partial), None);
     }
+
+    #[test]
+    fn test_find_sequences_in_varied_positions() {
+        let tracker = AltScreenTracker::new();
+
+        // Sequence at various offsets within a larger buffer
+        for offset in [0, 1, 10, 100, 1000] {
+            let mut data = vec![b'x'; offset];
+            data.extend_from_slice(ALT_SCREEN_ENTER);
+            data.extend_from_slice(b"trailing");
+            assert_eq!(
+                tracker.find_enter(&data),
+                Some(offset),
+                "should find enter at offset {offset}"
+            );
+        }
+
+        // Both modern and legacy at different offsets
+        let mut data = Vec::new();
+        data.extend_from_slice(b"prefix ");
+        let legacy_pos = data.len();
+        data.extend_from_slice(ALT_SCREEN_EXIT_LEGACY);
+        data.extend_from_slice(b" middle ");
+        data.extend_from_slice(ALT_SCREEN_EXIT);
+        // Should find the legacy (earlier) one
+        assert_eq!(tracker.find_exit(&data), Some(legacy_pos));
+    }
 }
