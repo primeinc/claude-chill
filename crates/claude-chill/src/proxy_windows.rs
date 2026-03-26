@@ -14,8 +14,8 @@ use crate::kitty_tracker_windows as kitty_tracker;
 use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::SyncBlockParser;
 use crate::terminal_windows::{
-    self, ConsoleMode, SIGINT_RECEIVED, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, TerminalSize,
-    get_terminal_size, setup_raw_mode, setup_signal_handlers,
+    self, ConsoleMode, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, TerminalSize, get_terminal_size,
+    setup_raw_mode, setup_signal_handlers,
 };
 use crate::vt_renderer::VtRenderer;
 use anyhow::{Context, Result};
@@ -24,7 +24,7 @@ use std::io::{self, Write};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
@@ -222,19 +222,53 @@ impl Proxy {
 
     /// Run the proxy event loop until the child process exits.
     /// Returns the child's exit code.
+    ///
+    /// Per Microsoft ConPTY docs: "To prevent race conditions and deadlocks,
+    /// we highly recommend that each of the communication channels is serviced
+    /// on a separate thread." The output pipe is read on a background thread
+    /// and sent to the main loop via a channel.
     pub fn run(&mut self) -> Result<i32> {
         let mut buf = [0u8; 65536];
         let mut stdout = io::stdout();
 
+        // Spawn a background thread to read from the ConPTY output pipe.
+        // ReadFile on an anonymous pipe is blocking, so it MUST be on its own thread.
+        // SAFETY: The pipe handle is valid for the lifetime of the proxy and is only
+        // used for reading on this thread. HANDLE is a raw pointer (*mut c_void) which
+        // isn't Send, but pipe handles are safe to use from any thread.
+        // Convert HANDLE to usize for thread transfer (HANDLE is *mut c_void,
+        // which isn't Send). usize round-trips safely on Windows.
+        let pipe_handle_raw = self.pipe_output_read as usize;
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let reader_thread = std::thread::spawn(move || {
+            let pipe_output_read = pipe_handle_raw as HANDLE;
+            let mut read_buf = vec![0u8; 65536];
+            loop {
+                let mut bytes_read: u32 = 0;
+                let ok = unsafe {
+                    ReadFile(
+                        pipe_output_read,
+                        read_buf.as_mut_ptr(),
+                        read_buf.len() as u32,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || bytes_read == 0 {
+                    break; // Pipe closed (child exited or ConPTY shut down)
+                }
+                if output_tx
+                    .send(read_buf[..bytes_read as usize].to_vec())
+                    .is_err()
+                {
+                    break; // Main thread dropped the receiver
+                }
+            }
+        });
+
         loop {
             // Check for signals
-            if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
-                // On Windows, Ctrl+C is handled via the console ctrl handler.
-                // The child process gets its own Ctrl+C event from the console.
-                // We just need to note we received it.
-            }
             if SIGTERM_RECEIVED.swap(false, Ordering::SeqCst) {
-                // Terminate the child
                 unsafe {
                     windows_sys::Win32::System::Threading::TerminateProcess(self.child_process, 1);
                 }
@@ -242,11 +276,6 @@ impl Proxy {
 
             // Poll for resize (Windows doesn't have SIGWINCH)
             self.check_resize()?;
-
-            // Wait for either child output or a short timeout (for stdin polling)
-            let wait_result = unsafe {
-                WaitForSingleObject(self.pipe_output_read, 10) // 10ms timeout
-            };
 
             // Flush pending renders
             if let Some(bytes) = self.renderer.flush_if_ready(
@@ -259,60 +288,56 @@ impl Proxy {
                 stdout.flush()?;
             }
 
-            if wait_result == WAIT_OBJECT_0 {
-                // Data available from child
-                let mut bytes_read: u32 = 0;
-                let ok = unsafe {
-                    ReadFile(
-                        self.pipe_output_read,
-                        buf.as_mut_ptr(),
-                        buf.len() as u32,
-                        &mut bytes_read,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || bytes_read == 0 {
-                    break; // Pipe closed or error
-                }
-                self.process_output(&buf[..bytes_read as usize], &mut stdout)?;
-            } else if wait_result == WAIT_TIMEOUT {
-                // Check for stdin input (non-blocking)
-                self.poll_stdin(&mut buf, &mut stdout)?;
-                self.check_auto_lookback(&mut stdout)?;
-            } else if wait_result == WAIT_FAILED {
-                // Check if child exited
-                let child_wait = unsafe { WaitForSingleObject(self.child_process, 0) };
-                if child_wait == WAIT_OBJECT_0 {
-                    break;
-                }
-                anyhow::bail!("WaitForSingleObject failed: {}", io::Error::last_os_error());
+            // Drain all available output from the reader thread (non-blocking)
+            let mut got_output = false;
+            while let Ok(data) = output_rx.try_recv() {
+                self.process_output(&data, &mut stdout)?;
+                got_output = true;
             }
 
-            // Check if child has exited
+            // Check for stdin input (non-blocking via GetNumberOfConsoleInputEvents)
+            self.poll_stdin(&mut buf, &mut stdout)?;
+
+            // Check auto-lookback
+            if !got_output {
+                self.check_auto_lookback(&mut stdout)?;
+            }
+
+            // Check if child has exited AND output pipe is drained
             let child_wait = unsafe { WaitForSingleObject(self.child_process, 0) };
             if child_wait == WAIT_OBJECT_0 {
-                // Drain remaining output
-                loop {
-                    let mut bytes_read: u32 = 0;
-                    let ok = unsafe {
-                        ReadFile(
-                            self.pipe_output_read,
-                            buf.as_mut_ptr(),
-                            buf.len() as u32,
-                            &mut bytes_read,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if ok == 0 || bytes_read == 0 {
-                        break;
-                    }
-                    self.process_output(&buf[..bytes_read as usize], &mut stdout)?;
+                // Child exited. Drain any remaining output from the channel.
+                // Give the reader thread a moment to flush.
+                std::thread::sleep(Duration::from_millis(50));
+                while let Ok(data) = output_rx.try_recv() {
+                    self.process_output(&data, &mut stdout)?;
                 }
                 break;
             }
+
+            // Small sleep to avoid busy-looping when no data is available
+            if !got_output {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
-        // Final render before exit
+        // Close the ConPTY BEFORE joining the reader thread.
+        // Per MS docs: "closing the pseudoconsole session may emit a final frame
+        // update to hOutput which should be drained from the communications channel
+        // buffer." The reader thread does this draining. ClosePseudoConsole will
+        // break the pipe, causing the reader thread's ReadFile to return 0/error.
+        unsafe { ClosePseudoConsole(self.conpty) };
+        self.conpty = 0; // Mark as closed so Drop doesn't double-close
+
+        // Now the reader thread can finish (pipe is broken)
+        let _ = reader_thread.join();
+
+        // Drain any final output the reader thread sent before exiting
+        while let Ok(data) = output_rx.try_recv() {
+            self.process_output(&data, &mut stdout)?;
+        }
+
+        // Final render
         if self.renderer.is_pending() {
             if let Some(bytes) = self.renderer.render() {
                 self.kitty_tracker.process(bytes);
@@ -325,36 +350,35 @@ impl Proxy {
     }
 
     fn poll_stdin(&mut self, buf: &mut [u8], stdout: &mut io::Stdout) -> Result<()> {
-        // Use non-blocking stdin read via Windows console input
-        let stdin = io::stdin();
-        let handle = stdin.lock();
-
-        // Try to read available input (this may block briefly on Windows)
-        // We rely on the 10ms timeout in the main loop to keep things responsive
         use windows_sys::Win32::System::Console::{
             GetNumberOfConsoleInputEvents, GetStdHandle, STD_INPUT_HANDLE,
         };
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         let mut num_events: u32 = 0;
-        if unsafe { GetNumberOfConsoleInputEvents(stdin_handle, &mut num_events) } != 0
-            && num_events > 0
-        {
-            // There's input available, read it
-            let mut bytes_read: u32 = 0;
-            let ok = unsafe {
-                ReadFile(
-                    stdin_handle,
-                    buf.as_mut_ptr(),
-                    buf.len().min(4096) as u32,
-                    &mut bytes_read,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok != 0 && bytes_read > 0 {
-                self.process_input(&buf[..bytes_read as usize], stdout)?;
-            }
+
+        // GetNumberOfConsoleInputEvents is non-blocking and tells us if there's
+        // input waiting. Only call ReadFile if there IS input, to avoid blocking.
+        if unsafe { GetNumberOfConsoleInputEvents(stdin_handle, &mut num_events) } == 0 {
+            // Not a console handle (e.g., piped input) — skip
+            return Ok(());
         }
-        drop(handle);
+        if num_events == 0 {
+            return Ok(());
+        }
+
+        let mut bytes_read: u32 = 0;
+        let ok = unsafe {
+            ReadFile(
+                stdin_handle,
+                buf.as_mut_ptr(),
+                buf.len().min(4096) as u32,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 && bytes_read > 0 {
+            self.process_input(&buf[..bytes_read as usize], stdout)?;
+        }
         Ok(())
     }
 
@@ -658,7 +682,10 @@ impl Proxy {
 impl Drop for Proxy {
     fn drop(&mut self) {
         unsafe {
-            ClosePseudoConsole(self.conpty);
+            // conpty may have been closed already in run() — check for null
+            if self.conpty != 0 {
+                ClosePseudoConsole(self.conpty);
+            }
             CloseHandle(self.pipe_input_write);
             CloseHandle(self.pipe_output_read);
             CloseHandle(self.child_process);
