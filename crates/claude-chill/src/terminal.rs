@@ -11,8 +11,11 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Set by the SIGWINCH handler when the terminal is resized.
 pub static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+/// Set by the SIGINT handler when Ctrl+C is pressed.
 pub static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+/// Set by the SIGTERM handler when a terminate signal is received.
 pub static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_: libc::c_int) {
@@ -27,6 +30,7 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::SeqCst);
 }
 
+/// Query the terminal dimensions via ioctl. Falls back to 24x80 on failure.
 pub fn get_terminal_size() -> Result<Winsize> {
     // SAFETY: Winsize is a plain C struct with no padding requirements;
     // zeroed memory is a valid initial state. TIOCGWINSZ writes the
@@ -46,6 +50,8 @@ pub fn get_terminal_size() -> Result<Winsize> {
     Ok(ws)
 }
 
+/// Put stdin into raw mode and return the original termios settings.
+/// Returns `None` if stdin is not a TTY.
 pub fn setup_raw_mode() -> Result<Option<Termios>> {
     let stdin = io::stdin();
     if !isatty(&stdin).unwrap_or(false) {
@@ -71,6 +77,7 @@ fn setup_signal_handler(signal: Signal, handler: extern "C" fn(libc::c_int)) -> 
     Ok(())
 }
 
+/// Install signal handlers for SIGWINCH, SIGINT, and SIGTERM.
 pub fn setup_signal_handlers() -> Result<()> {
     setup_signal_handler(Signal::SIGWINCH, handle_sigwinch)?;
     setup_signal_handler(Signal::SIGINT, handle_sigint)?;
@@ -78,6 +85,7 @@ pub fn setup_signal_handlers() -> Result<()> {
     Ok(())
 }
 
+/// Set a file descriptor to non-blocking mode.
 pub fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     let flags = fcntl(fd.as_fd(), FcntlArg::F_GETFL).context("fcntl F_GETFL failed")?;
     let flags = OFlag::from_bits_truncate(flags);
@@ -86,6 +94,7 @@ pub fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     Ok(())
 }
 
+/// Write all bytes to a file descriptor, retrying on EAGAIN/EINTR.
 pub fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     let mut written = 0;
     while written < data.len() {
@@ -98,10 +107,12 @@ pub fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Read from a file descriptor, returning the nix `Errno` on failure.
 pub fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
 
+/// Convert an `ExitStatus` to an integer exit code (128 + signal for signaled processes).
 pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
@@ -113,7 +124,7 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// Restore terminal settings. Called from Proxy::drop.
+/// Restore terminal settings. Called from `Proxy::drop`.
 pub fn restore_termios(termios: &Termios) {
     let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
 }
