@@ -64,6 +64,8 @@ const SYNC_BLOCK_DELAY_MS: u64 = 50;
 
 pub struct Proxy {
     config: ProxyConfig,
+    lookback_sequence_legacy: Vec<u8>,
+    lookback_sequence_kitty: Vec<u8>,
     pty_master: OwnedFd,
     child: Child,
     original_termios: Option<Termios>,
@@ -225,6 +227,8 @@ impl Proxy {
         history.push_bytes(CURSOR_HOME);
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+        let lookback_sequence_legacy = config.lookback_sequence_legacy.clone();
+        let lookback_sequence_kitty = config.lookback_sequence_kitty.clone();
 
         debug!("Proxy::spawn: command={command} args={args:?}");
 
@@ -232,6 +236,8 @@ impl Proxy {
             history,
             history_filter: HistoryFilter::new(),
             config,
+            lookback_sequence_legacy,
+            lookback_sequence_kitty,
             pty_master: pty.master,
             child,
             original_termios,
@@ -481,52 +487,20 @@ impl Proxy {
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        if !self.vt_render_pending || self.in_lookback_mode || self.alt_screen.in_alternate_screen()
-        {
-            return Ok(());
-        }
-
-        let elapsed = self
-            .last_output_time
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::MAX);
-
-        // Wait longer if in sync block (more data likely coming)
-        let delay = if self.sync_parser.in_sync_block() {
-            Duration::from_millis(SYNC_BLOCK_DELAY_MS)
-        } else {
-            Duration::from_millis(RENDER_DELAY_MS)
-        };
-
-        if elapsed >= delay {
+        if let Some(Duration::ZERO) = self.time_until_render() {
             self.render_vt_screen(stdout_fd)?;
         }
-
         Ok(())
     }
 
     fn time_until_render(&self) -> Option<Duration> {
-        if !self.vt_render_pending || self.in_lookback_mode || self.alt_screen.in_alternate_screen()
-        {
-            return None;
-        }
-
-        let elapsed = self
-            .last_output_time
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::MAX);
-
-        let delay = if self.sync_parser.in_sync_block() {
-            Duration::from_millis(SYNC_BLOCK_DELAY_MS)
-        } else {
-            Duration::from_millis(RENDER_DELAY_MS)
-        };
-
-        if elapsed >= delay {
-            Some(Duration::ZERO)
-        } else {
-            Some(delay - elapsed)
-        }
+        compute_render_delay(
+            self.vt_render_pending,
+            self.in_lookback_mode,
+            self.alt_screen.in_alternate_screen(),
+            self.sync_parser.in_sync_block(),
+            self.last_output_time.map(|t| t.elapsed()),
+        )
     }
 
     fn render_vt_screen<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
@@ -567,38 +541,27 @@ impl Proxy {
     }
 
     fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        if self.auto_lookback_timeout.is_zero() {
+        let now = Instant::now();
+        if !should_auto_lookback(
+            self.auto_lookback_timeout,
+            self.in_lookback_mode,
+            self.alt_screen.in_alternate_screen(),
+            self.last_stdin_time.map(|t| now.duration_since(t)),
+            self.last_render_time,
+            self.last_auto_lookback_time,
+            now,
+        ) {
             return Ok(());
-        }
-        if self.in_lookback_mode || self.alt_screen.in_alternate_screen() {
-            return Ok(());
-        }
-
-        // Check if enough time has passed since last stdin activity
-        let Some(stdin_time) = self.last_stdin_time else {
-            return Ok(());
-        };
-        if stdin_time.elapsed() < self.auto_lookback_timeout {
-            return Ok(());
-        }
-
-        // Check if there's been new output since last auto-lookback
-        // AND enough time has passed since we last dumped
-        let Some(render_time) = self.last_render_time else {
-            return Ok(());
-        };
-        if let Some(last_auto) = self.last_auto_lookback_time {
-            let no_new_output = render_time <= last_auto;
-            let too_soon = last_auto.elapsed() < self.auto_lookback_timeout;
-            if no_new_output || too_soon {
-                return Ok(());
-            }
         }
 
         debug!(
             "auto_lookback triggered: stdin_idle={}ms render_age={}ms last_auto_age={}ms",
-            stdin_time.elapsed().as_millis(),
-            render_time.elapsed().as_millis(),
+            self.last_stdin_time
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0),
+            self.last_render_time
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0),
             self.last_auto_lookback_time
                 .map(|t| t.elapsed().as_millis())
                 .unwrap_or(0)
@@ -643,11 +606,17 @@ impl Proxy {
             return write_all(&self.pty_master, data);
         }
 
-        // Copy to local to avoid holding an immutable borrow on self.config across the loop
-        let lookback_sequence: Vec<u8> = if self.kitty_tracker.mode_enabled() {
-            self.config.lookback_sequence_kitty.clone()
+        // Stack-copy to avoid borrowing self across mutable calls.
+        // Lookback sequences are always small (≤7 bytes).
+        let mut seq_buf = [0u8; 16];
+        let seq = if self.kitty_tracker.mode_enabled() {
+            let len = self.lookback_sequence_kitty.len().min(seq_buf.len());
+            seq_buf[..len].copy_from_slice(&self.lookback_sequence_kitty[..len]);
+            &seq_buf[..len]
         } else {
-            self.config.lookback_sequence_legacy.clone()
+            let len = self.lookback_sequence_legacy.len().min(seq_buf.len());
+            seq_buf[..len].copy_from_slice(&self.lookback_sequence_legacy[..len]);
+            &seq_buf[..len]
         };
 
         for &byte in data {
@@ -657,12 +626,11 @@ impl Proxy {
                 continue;
             }
 
-            let lookback_action =
-                sequence_match::check(&self.lookback_input_buffer, byte, &lookback_sequence);
+            let lookback_action = sequence_match::check(&self.lookback_input_buffer, byte, seq);
 
             self.lookback_input_buffer.push(byte);
-            if self.lookback_input_buffer.len() > lookback_sequence.len() {
-                let excess = self.lookback_input_buffer.len() - lookback_sequence.len();
+            if self.lookback_input_buffer.len() > seq.len() {
+                let excess = self.lookback_input_buffer.len() - seq.len();
                 self.lookback_input_buffer.drain(..excess);
             }
 
@@ -766,11 +734,17 @@ impl Proxy {
             // Force full render on next frame since size changed
             self.vt_prev_screen = None;
             // Forward to child process
-            unsafe {
+            let ret = unsafe {
                 libc::ioctl(
                     self.pty_master.as_raw_fd(),
                     libc::TIOCSWINSZ as libc::c_ulong,
                     &winsize,
+                )
+            };
+            if ret == -1 {
+                debug!(
+                    "forward_winsize: TIOCSWINSZ ioctl failed: {}",
+                    io::Error::last_os_error()
                 );
             }
         }
@@ -877,4 +851,353 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
 
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
+}
+
+/// Pure decision: should auto-lookback trigger?
+/// Returns true if all conditions for auto-lookback are met.
+fn should_auto_lookback(
+    timeout: Duration,
+    in_lookback_mode: bool,
+    in_alt_screen: bool,
+    stdin_elapsed: Option<Duration>,
+    render_time: Option<Instant>,
+    last_auto_time: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if timeout.is_zero() || in_lookback_mode || in_alt_screen {
+        return false;
+    }
+
+    let Some(stdin_idle) = stdin_elapsed else {
+        return false;
+    };
+    if stdin_idle < timeout {
+        return false;
+    }
+
+    let Some(render_t) = render_time else {
+        return false;
+    };
+
+    if let Some(last_auto) = last_auto_time {
+        let no_new_output = render_t <= last_auto;
+        let too_soon = now.duration_since(last_auto) < timeout;
+        if no_new_output || too_soon {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Pure decision: compute the delay before the next VT render.
+/// Returns None if no render is pending or rendering is suppressed.
+fn compute_render_delay(
+    vt_render_pending: bool,
+    in_lookback_mode: bool,
+    in_alt_screen: bool,
+    in_sync_block: bool,
+    output_elapsed: Option<Duration>,
+) -> Option<Duration> {
+    if !vt_render_pending || in_lookback_mode || in_alt_screen {
+        return None;
+    }
+
+    let elapsed = output_elapsed.unwrap_or(Duration::MAX);
+
+    let delay = if in_sync_block {
+        Duration::from_millis(SYNC_BLOCK_DELAY_MS)
+    } else {
+        Duration::from_millis(RENDER_DELAY_MS)
+    };
+
+    if elapsed >= delay {
+        Some(Duration::ZERO)
+    } else {
+        Some(delay - elapsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ================================================================
+    // Auto-lookback decision tests
+    // ================================================================
+
+    #[test]
+    fn test_auto_lookback_disabled_when_timeout_zero() {
+        let now = Instant::now();
+        assert!(!should_auto_lookback(
+            Duration::ZERO,
+            false,
+            false,
+            Some(Duration::from_secs(100)),
+            Some(now - Duration::from_secs(50)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_disabled_in_lookback_mode() {
+        let now = Instant::now();
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            true,
+            false,
+            Some(Duration::from_secs(100)),
+            Some(now - Duration::from_secs(50)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_disabled_in_alt_screen() {
+        let now = Instant::now();
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            true,
+            Some(Duration::from_secs(100)),
+            Some(now - Duration::from_secs(50)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_disabled_no_stdin() {
+        let now = Instant::now();
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            None,
+            Some(now - Duration::from_secs(50)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_disabled_stdin_too_recent() {
+        let now = Instant::now();
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            Some(Duration::from_secs(5)), // only 5s idle, need 15s
+            Some(now - Duration::from_secs(50)),
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_disabled_no_render() {
+        let now = Instant::now();
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            Some(Duration::from_secs(20)),
+            None, // no render has happened
+            None,
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_triggers_first_time() {
+        let now = Instant::now();
+        assert!(should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            Some(Duration::from_secs(20)), // idle 20s > 15s timeout
+            Some(now - Duration::from_secs(10)), // rendered 10s ago
+            None,                          // never auto-lookbacked before
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_suppressed_no_new_output() {
+        let now = Instant::now();
+        let last_auto = now - Duration::from_secs(20);
+        let render_before_auto = now - Duration::from_secs(25);
+        // render_time <= last_auto_time means no new output since last auto
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            Some(Duration::from_secs(30)),
+            Some(render_before_auto),
+            Some(last_auto),
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_suppressed_too_soon() {
+        let now = Instant::now();
+        let last_auto = now - Duration::from_secs(5); // only 5s ago
+        let render_after_auto = now - Duration::from_secs(3); // new output exists
+        assert!(!should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            Some(Duration::from_secs(30)),
+            Some(render_after_auto),
+            Some(last_auto),
+            now,
+        ));
+    }
+
+    #[test]
+    fn test_auto_lookback_triggers_with_new_output_after_cooldown() {
+        let now = Instant::now();
+        let last_auto = now - Duration::from_secs(20); // 20s ago, past 15s cooldown
+        let render_after_auto = now - Duration::from_secs(10); // new output since last auto
+        assert!(should_auto_lookback(
+            Duration::from_secs(15),
+            false,
+            false,
+            Some(Duration::from_secs(30)),
+            Some(render_after_auto),
+            Some(last_auto),
+            now,
+        ));
+    }
+
+    // ================================================================
+    // Render delay decision tests
+    // ================================================================
+
+    #[test]
+    fn test_render_delay_none_when_not_pending() {
+        assert_eq!(
+            compute_render_delay(false, false, false, false, Some(Duration::from_millis(100))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_render_delay_none_in_lookback() {
+        assert_eq!(
+            compute_render_delay(true, true, false, false, Some(Duration::from_millis(100))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_render_delay_none_in_alt_screen() {
+        assert_eq!(
+            compute_render_delay(true, false, true, false, Some(Duration::from_millis(100))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_render_delay_immediate_when_enough_time_passed() {
+        assert_eq!(
+            compute_render_delay(true, false, false, false, Some(Duration::from_millis(100))),
+            Some(Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn test_render_delay_short_outside_sync_block() {
+        // 2ms elapsed, 5ms delay → 3ms remaining
+        let result =
+            compute_render_delay(true, false, false, false, Some(Duration::from_millis(2)));
+        assert!(result.is_some());
+        let remaining = result.unwrap();
+        assert!(remaining > Duration::ZERO);
+        assert!(remaining <= Duration::from_millis(RENDER_DELAY_MS));
+    }
+
+    #[test]
+    fn test_render_delay_longer_in_sync_block() {
+        // 10ms elapsed, 50ms sync delay → 40ms remaining
+        let result =
+            compute_render_delay(true, false, false, true, Some(Duration::from_millis(10)));
+        assert!(result.is_some());
+        let remaining = result.unwrap();
+        assert!(remaining > Duration::from_millis(30));
+        assert!(remaining <= Duration::from_millis(SYNC_BLOCK_DELAY_MS));
+    }
+
+    #[test]
+    fn test_render_delay_immediate_when_sync_delay_exceeded() {
+        assert_eq!(
+            compute_render_delay(true, false, false, true, Some(Duration::from_millis(100))),
+            Some(Duration::ZERO),
+        );
+    }
+
+    // ================================================================
+    // apply_segment_to_history tests (via LineBuffer directly)
+    // ================================================================
+
+    #[test]
+    fn test_apply_passthrough_to_history() {
+        let mut history = LineBuffer::new(1000);
+        let mut history_filter = HistoryFilter::new();
+
+        let data = b"hello world\n";
+        let filtered = history_filter.filter(data);
+        history.push_bytes(&filtered);
+
+        let mut output = Vec::new();
+        history.append_all(&mut output);
+        assert!(!output.is_empty());
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("hello world"));
+    }
+
+    #[test]
+    fn test_history_cleared_on_full_redraw() {
+        let mut history = LineBuffer::new(1000);
+        history.push_bytes(b"old content\n");
+
+        // Simulate full redraw: clear history and re-seed
+        history.clear();
+        history.push_bytes(CLEAR_SCREEN);
+        history.push_bytes(CURSOR_HOME);
+        history.push_bytes(b"new content\n");
+
+        let mut output = Vec::new();
+        history.append_all(&mut output);
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("old content"));
+        assert!(text.contains("new content"));
+    }
+
+    #[test]
+    fn test_sync_block_full_redraw_detection() {
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(SYNC_START);
+        input.extend_from_slice(CLEAR_SCREEN);
+        input.extend_from_slice(CURSOR_HOME);
+        input.extend_from_slice(b"screen content");
+        input.extend_from_slice(SYNC_END);
+
+        parser.parse(&input, &mut segments);
+        assert_eq!(segments.len(), 1);
+
+        // Simulate apply_segment_to_history behavior
+        match &segments[0] {
+            OutputSegment::SyncBlock { is_full_redraw, .. } => {
+                assert!(is_full_redraw, "should detect full redraw");
+            }
+            _ => panic!("expected SyncBlock"),
+        }
+    }
 }

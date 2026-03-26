@@ -577,4 +577,129 @@ mod tests {
         let output = filter.filter(input);
         assert!(output.is_empty(), "OSC query should be filtered");
     }
+
+    // ====================================================================
+    // Round-trip fidelity tests: verify that the parse→classify→re-encode
+    // pipeline produces byte-equivalent output for common escape sequences.
+    // ====================================================================
+
+    /// Helper: assert that filtering produces byte-identical output.
+    fn assert_roundtrip_exact(input: &[u8], label: &str) {
+        let mut filter = HistoryFilter::new();
+        let output = filter.filter(input);
+        assert_eq!(
+            output, input,
+            "Round-trip fidelity failed for {label}: input={input:?} output={output:?}"
+        );
+    }
+
+    /// Helper: assert that filtering produces output that a VT100 parser
+    /// renders to the same screen contents as the input.
+    fn assert_roundtrip_visual(input: &[u8], label: &str) {
+        let mut filter = HistoryFilter::new();
+        let output = filter.filter(input);
+
+        let mut parser_in = vt100::Parser::new(24, 80, 0);
+        parser_in.process(input);
+        let mut parser_out = vt100::Parser::new(24, 80, 0);
+        parser_out.process(&output);
+
+        let screen_in = parser_in.screen().contents();
+        let screen_out = parser_out.screen().contents();
+        assert_eq!(screen_in, screen_out, "Visual fidelity failed for {label}");
+    }
+
+    #[test]
+    fn test_roundtrip_plain_text() {
+        assert_roundtrip_exact(b"Hello, World!", "plain text");
+    }
+
+    #[test]
+    fn test_roundtrip_newlines() {
+        assert_roundtrip_exact(b"line1\r\nline2\r\n", "CRLF text");
+    }
+
+    #[test]
+    fn test_roundtrip_clear_screen() {
+        assert_roundtrip_exact(b"\x1b[2J", "clear screen");
+    }
+
+    #[test]
+    fn test_roundtrip_cursor_home() {
+        assert_roundtrip_exact(b"\x1b[H", "cursor home");
+    }
+
+    #[test]
+    fn test_roundtrip_erase_line() {
+        assert_roundtrip_exact(b"\x1b[K", "erase to end of line");
+    }
+
+    #[test]
+    fn test_roundtrip_sgr_reset() {
+        assert_roundtrip_exact(b"\x1b[0m", "SGR reset");
+    }
+
+    #[test]
+    fn test_roundtrip_cursor_movement() {
+        // Cursor to specific position
+        assert_roundtrip_exact(b"\x1b[10;20H", "cursor position");
+    }
+
+    #[test]
+    fn test_roundtrip_cursor_up() {
+        assert_roundtrip_exact(b"\x1b[5A", "cursor up 5");
+    }
+
+    #[test]
+    fn test_roundtrip_scroll_up() {
+        assert_roundtrip_exact(b"\x1b[3S", "scroll up 3");
+    }
+
+    #[test]
+    fn test_roundtrip_insert_lines() {
+        assert_roundtrip_exact(b"\x1b[2L", "insert 2 lines");
+    }
+
+    #[test]
+    fn test_roundtrip_sgr_visual_fidelity() {
+        // SGR may re-encode (e.g., bold+red), so test visual equivalence
+        assert_roundtrip_visual(b"\x1b[1;31mBold Red\x1b[0m Normal", "bold red SGR");
+    }
+
+    #[test]
+    fn test_roundtrip_256_color_visual_fidelity() {
+        assert_roundtrip_visual(b"\x1b[38;5;196mRed256\x1b[0m", "256-color SGR");
+    }
+
+    #[test]
+    fn test_roundtrip_truecolor_visual_fidelity() {
+        assert_roundtrip_visual(b"\x1b[38;2;255;128;0mOrange\x1b[0m", "truecolor SGR");
+    }
+
+    #[test]
+    fn test_roundtrip_mixed_visual_fidelity() {
+        // A realistic Claude Code output snippet: cursor positioning + SGR + text
+        let input = b"\x1b[H\x1b[2J\x1b[1;1H\x1b[1;34mFile:\x1b[0m src/main.rs\r\n\x1b[32m+ added line\x1b[0m\r\n";
+        assert_roundtrip_visual(input, "mixed Claude-like output");
+    }
+
+    #[test]
+    fn test_roundtrip_dec_line_drawing() {
+        // DEC special graphics mode (box drawing)
+        assert_roundtrip_exact(b"\x1b(0", "DEC line drawing G0");
+        assert_roundtrip_exact(b"\x1b(B", "ASCII charset G0");
+    }
+
+    #[test]
+    fn test_roundtrip_save_restore_cursor() {
+        assert_roundtrip_exact(b"\x1b7", "save cursor");
+        assert_roundtrip_exact(b"\x1b8", "restore cursor");
+    }
+
+    #[test]
+    fn test_roundtrip_tab_and_newline() {
+        assert_roundtrip_exact(b"\t", "tab");
+        assert_roundtrip_exact(b"\n", "newline");
+        assert_roundtrip_exact(b"\r", "carriage return");
+    }
 }

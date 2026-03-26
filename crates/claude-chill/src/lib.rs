@@ -1,6 +1,5 @@
 pub mod alt_screen;
 pub mod config;
-pub mod escape_filter;
 pub mod escape_sequences;
 pub mod history_filter;
 pub mod key_parser;

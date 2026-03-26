@@ -1,3 +1,4 @@
+use memchr::memchr;
 use std::collections::VecDeque;
 
 pub struct LineBuffer {
@@ -33,8 +34,29 @@ impl LineBuffer {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.push_byte(byte);
+        let mut pos = 0;
+        while pos < bytes.len() {
+            match memchr(b'\n', &bytes[pos..]) {
+                Some(idx) => {
+                    // Append everything before (and not including) the newline to current_line
+                    self.current_line.extend_from_slice(&bytes[pos..pos + idx]);
+                    // Commit the line
+                    let line = std::mem::take(&mut self.current_line);
+                    self.cached_bytes += line.len() + 1;
+                    self.lines.push_back(line);
+                    if self.lines.len() > self.max_lines
+                        && let Some(removed) = self.lines.pop_front()
+                    {
+                        self.cached_bytes -= removed.len() + 1;
+                    }
+                    pos += idx + 1;
+                }
+                None => {
+                    // No more newlines — append remainder to current_line
+                    self.current_line.extend_from_slice(&bytes[pos..]);
+                    break;
+                }
+            }
         }
     }
 
