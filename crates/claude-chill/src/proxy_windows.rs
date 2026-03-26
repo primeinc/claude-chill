@@ -11,6 +11,8 @@ use crate::escape_sequences::SYNC_START;
 use crate::escape_sequences::{CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY};
 use crate::history_manager::HistoryManager;
 use crate::kitty_tracker_windows as kitty_tracker;
+pub use crate::proxy_common::ProxyConfig;
+use crate::proxy_common::should_auto_lookback;
 use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::SyncBlockParser;
 use crate::terminal_windows::{
@@ -37,32 +39,6 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
-
-/// Configuration for the PTY proxy.
-pub struct ProxyConfig {
-    /// Maximum number of lines retained in the lookback history buffer.
-    pub max_history_lines: usize,
-    /// Human-readable key name for display in the lookback mode banner.
-    pub lookback_key: String,
-    /// Byte sequence that triggers lookback mode in legacy terminal mode.
-    pub lookback_sequence_legacy: Vec<u8>,
-    /// Byte sequence that triggers lookback mode in Kitty keyboard protocol mode.
-    pub lookback_sequence_kitty: Vec<u8>,
-    /// Idle timeout in ms before auto-lookback triggers (0 to disable).
-    pub auto_lookback_timeout_ms: u64,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            max_history_lines: 100_000,
-            lookback_key: "[ctrl][6]".to_string(),
-            lookback_sequence_legacy: vec![0x1E],
-            lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
-            auto_lookback_timeout_ms: 15000,
-        }
-    }
-}
 
 /// PTY proxy using Windows ConPTY for pseudo-console support.
 pub struct Proxy {
@@ -697,24 +673,75 @@ impl Drop for Proxy {
     }
 }
 
+/// Quote a single argument for the Windows command line using the
+/// `CommandLineToArgvW` escaping convention.
+///
+/// Rules (per Microsoft docs):
+/// - Arguments containing spaces, tabs, or double quotes are wrapped in quotes.
+/// - Backslashes are literal unless immediately preceding a double quote.
+/// - A run of N backslashes before a `"` becomes 2N+1 backslashes plus `"`.
+/// - A run of N backslashes at the end of the argument (before closing `"`)
+///   becomes 2N backslashes.
+/// - Empty arguments are quoted as `""`.
+fn quote_arg_windows(arg: &str) -> String {
+    // If the arg doesn't need quoting, return it as-is.
+    // This preserves cmd.exe /c semantics where unconditional quoting
+    // changes how the command tail is interpreted.
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 4);
+    quoted.push('"');
+
+    let mut backslash_count: usize = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => {
+                backslash_count += 1;
+            }
+            '"' => {
+                // Double the backslashes before a quote, then escape the quote
+                for _ in 0..(backslash_count * 2) {
+                    quoted.push('\\');
+                }
+                backslash_count = 0;
+                quoted.push('\\');
+                quoted.push('"');
+            }
+            _ => {
+                // Backslashes not before a quote are literal
+                for _ in 0..backslash_count {
+                    quoted.push('\\');
+                }
+                backslash_count = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+
+    // Double any trailing backslashes (they precede the closing quote)
+    for _ in 0..(backslash_count * 2) {
+        quoted.push('\\');
+    }
+
+    quoted.push('"');
+    quoted
+}
+
 /// Create a child process attached to the given ConPTY.
 ///
 /// Per MS docs: uses InitializeProcThreadAttributeList + UpdateProcThreadAttribute
 /// with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, then CreateProcessW with
 /// EXTENDED_STARTUPINFO_PRESENT.
 fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(HANDLE, HANDLE)> {
-    // Build command line string
-    let mut cmd_line = command.to_string();
+    // Build command line string with proper escaping.
+    // Uses the CommandLineToArgvW-compatible quoting algorithm from Microsoft docs:
+    // https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments
+    let mut cmd_line = quote_arg_windows(command);
     for arg in args {
         cmd_line.push(' ');
-        // Simple quoting for args with spaces
-        if arg.contains(' ') {
-            cmd_line.push('"');
-            cmd_line.push_str(arg);
-            cmd_line.push('"');
-        } else {
-            cmd_line.push_str(arg);
-        }
+        cmd_line.push_str(&quote_arg_windows(arg));
     }
     let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -792,77 +819,11 @@ fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(
     Ok((proc_info.hProcess, proc_info.hThread))
 }
 
-/// Pure decision: should auto-lookback trigger?
-#[must_use]
-fn should_auto_lookback(
-    timeout: Duration,
-    in_lookback_mode: bool,
-    in_alt_screen: bool,
-    stdin_elapsed: Option<Duration>,
-    render_time: Option<Instant>,
-    last_auto_time: Option<Instant>,
-    now: Instant,
-) -> bool {
-    if timeout.is_zero() || in_lookback_mode || in_alt_screen {
-        return false;
-    }
-
-    let Some(stdin_idle) = stdin_elapsed else {
-        return false;
-    };
-    if stdin_idle < timeout {
-        return false;
-    }
-
-    let Some(render_t) = render_time else {
-        return false;
-    };
-
-    if let Some(last_auto) = last_auto_time {
-        let no_new_output = render_t <= last_auto;
-        let too_soon = now.duration_since(last_auto) < timeout;
-        if no_new_output || too_soon {
-            return false;
-        }
-    }
-
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::history_manager::HistoryManager;
     use crate::sync_block::SyncBlockParser;
-
-    // Auto-lookback tests (same as unix proxy)
-    #[test]
-    fn test_auto_lookback_disabled_when_timeout_zero() {
-        let now = Instant::now();
-        assert!(!should_auto_lookback(
-            Duration::ZERO,
-            false,
-            false,
-            Some(Duration::from_secs(100)),
-            Some(now - Duration::from_secs(50)),
-            None,
-            now,
-        ));
-    }
-
-    #[test]
-    fn test_auto_lookback_triggers_first_time() {
-        let now = Instant::now();
-        assert!(should_auto_lookback(
-            Duration::from_secs(15),
-            false,
-            false,
-            Some(Duration::from_secs(20)),
-            Some(now - Duration::from_secs(10)),
-            None,
-            now,
-        ));
-    }
 
     // Alt screen + sync block integration test
     fn history_text(hm: &HistoryManager) -> String {
@@ -905,5 +866,75 @@ mod tests {
         let text = history_text(&hm);
         assert!(text.contains("initial output"));
         assert!(text.contains("sync content before alt"));
+    }
+
+    // ================================================================
+    // Windows argument quoting tests
+    // ================================================================
+
+    #[test]
+    fn test_quote_simple_arg_no_quoting_needed() {
+        // No spaces, quotes, or tabs — returned as-is
+        assert_eq!(quote_arg_windows("hello"), "hello");
+    }
+
+    #[test]
+    fn test_quote_arg_with_spaces() {
+        assert_eq!(quote_arg_windows("hello world"), r#""hello world""#);
+    }
+
+    #[test]
+    fn test_quote_arg_with_tab() {
+        assert_eq!(quote_arg_windows("a\tb"), "\"a\tb\"");
+    }
+
+    #[test]
+    fn test_quote_arg_with_embedded_quote() {
+        assert_eq!(quote_arg_windows(r#"say "hi""#), r#""say \"hi\"""#);
+    }
+
+    #[test]
+    fn test_quote_arg_with_backslash_before_quote() {
+        // Contains a quote, so it gets quoted. Trailing backslash before
+        // the embedded quote must be doubled.
+        assert_eq!(quote_arg_windows(r#"path\"#), r"path\");
+    }
+
+    #[test]
+    fn test_quote_arg_trailing_backslash_with_space() {
+        // Has a space so it must be quoted, trailing backslash doubled
+        assert_eq!(quote_arg_windows(r"path with\"), r#""path with\\""#);
+    }
+
+    #[test]
+    fn test_quote_arg_with_backslashes_before_quote() {
+        // Contains no spaces/quotes/tabs — returned as-is
+        assert_eq!(quote_arg_windows(r"a\\"), r"a\\");
+    }
+
+    #[test]
+    fn test_quote_arg_backslash_not_before_quote() {
+        // No special chars — returned as-is
+        assert_eq!(quote_arg_windows(r"a\b"), r"a\b");
+    }
+
+    #[test]
+    fn test_quote_arg_empty() {
+        assert_eq!(quote_arg_windows(""), r#""""#);
+    }
+
+    #[test]
+    fn test_quote_arg_injection_attempt() {
+        // This is the injection payload from the audit — contains quotes
+        let malicious = r#"foo" & del /q C:\* & ""#;
+        let quoted = quote_arg_windows(malicious);
+        // The embedded quotes must be escaped so they can't break out
+        assert_eq!(quoted, r#""foo\" & del /q C:\* & \"""#);
+    }
+
+    #[test]
+    fn test_quote_arg_backslashes_before_embedded_quote() {
+        // Backslashes immediately before an embedded quote must be doubled
+        assert_eq!(quote_arg_windows(r#"a\\"b"#), r#""a\\\\\"b""#);
     }
 }

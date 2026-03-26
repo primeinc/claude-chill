@@ -13,6 +13,7 @@ pub mod history_filter;
 pub mod history_manager;
 pub mod key_parser;
 pub mod line_buffer;
+pub mod proxy_common;
 pub mod sequence_match;
 pub mod sync_block;
 pub mod vt_renderer;

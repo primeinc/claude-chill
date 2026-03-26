@@ -5,10 +5,11 @@ use claude_chill::config::Config;
 use claude_chill::key_parser;
 use claude_chill::proxy::{Proxy, ProxyConfig};
 use log::debug;
-use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    // Only enable logging if CLAUDE_CHILL_LOG_FILE is set
+fn main() {
+    // File-based debug logging — only available in debug builds to avoid
+    // exposing an arbitrary file-write capability in release binaries.
+    #[cfg(debug_assertions)]
     if let Ok(log_file) = std::env::var("CLAUDE_CHILL_LOG_FILE") {
         use std::fs::OpenOptions;
         if let Ok(file) = OpenOptions::new()
@@ -66,17 +67,22 @@ fn main() -> ExitCode {
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();
 
-    match Proxy::spawn(&cli.command, &cmd_args, proxy_config) {
+    // The exit code is collected after Proxy is dropped (restoring terminal state).
+    // We use std::process::exit() instead of ExitCode to preserve the full i32 range
+    // (ExitCode::from(u8) truncates codes > 255).
+    let code = match Proxy::spawn(&cli.command, &cmd_args, proxy_config) {
         Ok(mut proxy) => match proxy.run() {
-            Ok(exit_code) => ExitCode::from(exit_code as u8),
+            Ok(exit_code) => exit_code,
             Err(e) => {
                 eprintln!("Proxy error: {e}");
-                ExitCode::from(1)
+                1
             }
         },
         Err(e) => {
             eprintln!("Failed to start proxy: {e:#}");
-            ExitCode::from(1)
+            1
         }
-    }
+    };
+    // Proxy is dropped here, restoring terminal state before exit.
+    std::process::exit(code)
 }
