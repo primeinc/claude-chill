@@ -1,3 +1,5 @@
+//! Streaming byte-at-a-time sequence matcher for detecting lookback key input.
+
 /// Result of checking whether a byte sequence is being matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceMatch {
