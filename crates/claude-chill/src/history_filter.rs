@@ -785,4 +785,61 @@ mod tests {
             "SGR reset must produce same visual result"
         );
     }
+
+    // ====================================================================
+    // Fast-path tests: verify that all-safe input is returned byte-exactly
+    // ====================================================================
+
+    #[test]
+    fn test_fast_path_plain_text() {
+        let mut filter = HistoryFilter::new();
+        let input = b"Hello, World!";
+        let output = filter.filter(input);
+        assert_eq!(
+            output, input,
+            "fast path: plain text should return exact bytes"
+        );
+    }
+
+    #[test]
+    fn test_fast_path_combined_sgr() {
+        // Combined SGR was previously re-encoded differently by Display.
+        // The fast path should now return the original bytes.
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[1;31mBold Red\x1b[0m";
+        let output = filter.filter(input);
+        assert_eq!(
+            output,
+            input.to_vec(),
+            "fast path: combined SGR should return exact bytes"
+        );
+    }
+
+    #[test]
+    fn test_fast_path_cursor_with_defaults() {
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[1;1H";
+        let output = filter.filter(input);
+        assert_eq!(
+            output,
+            input.to_vec(),
+            "fast path: cursor position should return exact bytes"
+        );
+    }
+
+    #[test]
+    fn test_slow_path_mixed_content() {
+        // When blacklisted content is present, the slow path is used.
+        // Verify it still works correctly.
+        let mut filter = HistoryFilter::new();
+        let input = b"Hello\x1b[?1004hWorld"; // focus tracking in middle
+        let output = filter.filter(input);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("Hello"), "slow path should keep safe text");
+        assert!(text.contains("World"), "slow path should keep safe text");
+        assert!(
+            !text.contains("1004"),
+            "slow path should strip unsafe sequences"
+        );
+    }
 }
