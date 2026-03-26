@@ -557,4 +557,116 @@ mod tests {
         let key = parse("[pageup]").unwrap();
         assert_eq!(key.to_kitty_sequence(), None);
     }
+
+    // ====================================================================
+    // Error handling and edge case tests
+    // ====================================================================
+
+    #[test]
+    fn test_error_empty_input() {
+        let result = parse("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_no_brackets() {
+        let result = parse("ctrl+c");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_missing_closing_bracket() {
+        let result = parse("[ctrl][a");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_multiple_key_codes() {
+        let result = parse("[a][b]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_unknown_key_name() {
+        let result = parse("[ctrl][superduperkey]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_only_modifiers() {
+        // ctrl+shift with no actual key
+        let result = parse("[ctrl][shift]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_error_display() {
+        let err = parse("[ctrl][badkey]").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("badkey"), "error should mention the bad key");
+        assert!(
+            msg.contains("[ctrl][badkey]"),
+            "error should include the raw input"
+        );
+    }
+
+    #[test]
+    fn test_parse_key_aliases() {
+        // Test all documented key name aliases
+        assert!(parse("[esc]").is_ok());
+        assert!(parse("[escape]").is_ok());
+        assert!(parse("[enter]").is_ok());
+        assert!(parse("[return]").is_ok());
+        assert!(parse("[bs]").is_ok());
+        assert!(parse("[backspace]").is_ok());
+        assert!(parse("[del]").is_ok());
+        assert!(parse("[delete]").is_ok());
+        assert!(parse("[ins]").is_ok());
+        assert!(parse("[insert]").is_ok());
+        assert!(parse("[pgup]").is_ok());
+        assert!(parse("[pageup]").is_ok());
+        assert!(parse("[pgdn]").is_ok());
+        assert!(parse("[pgdown]").is_ok());
+        assert!(parse("[pagedown]").is_ok());
+    }
+
+    #[test]
+    fn test_parse_control_alias() {
+        let key = parse("[control][a]").unwrap();
+        assert!(key.modifiers.ctrl);
+        assert_eq!(key.code, KeyCode::Char('a'));
+    }
+
+    #[test]
+    fn test_escape_sequence_all_function_keys() {
+        for n in 1..=12 {
+            let key = parse(&format!("[f{n}]")).unwrap();
+            assert_eq!(key.code, KeyCode::F(n));
+            let seq = key.to_escape_sequence();
+            // All function keys should produce escape sequences starting with ESC [
+            assert!(seq.starts_with(b"\x1b["), "f{n} should start with ESC [");
+        }
+    }
+
+    #[test]
+    fn test_escape_sequence_arrows() {
+        let key_up = parse("[up]").unwrap();
+        assert_eq!(key_up.to_escape_sequence(), b"\x1b[A".to_vec());
+        let key_down = parse("[down]").unwrap();
+        assert_eq!(key_down.to_escape_sequence(), b"\x1b[B".to_vec());
+        let key_right = parse("[right]").unwrap();
+        assert_eq!(key_right.to_escape_sequence(), b"\x1b[C".to_vec());
+        let key_left = parse("[left]").unwrap();
+        assert_eq!(key_left.to_escape_sequence(), b"\x1b[D".to_vec());
+    }
+
+    #[test]
+    fn test_display_roundtrip() {
+        // Display output should be parseable back to the same key
+        let original = parse("[ctrl][shift][f5]").unwrap();
+        let displayed = original.to_string();
+        let reparsed = parse(&displayed).unwrap();
+        assert_eq!(original.code, reparsed.code);
+        assert_eq!(original.modifiers, reparsed.modifiers);
+    }
 }

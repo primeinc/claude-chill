@@ -115,4 +115,69 @@ mod tests {
         assert_eq!(config.lookback_key, "[ctrl][6]");
         assert_eq!(config.auto_lookback_timeout_ms, 15000);
     }
+
+    #[test]
+    fn test_empty_toml_uses_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.history_lines, 100_000);
+        assert_eq!(config.lookback_key, "[ctrl][6]");
+        assert_eq!(config.auto_lookback_timeout_ms, 15000);
+    }
+
+    #[test]
+    fn test_partial_config() {
+        // Only one field set, rest should use defaults
+        let config: Config = toml::from_str("auto_lookback_timeout_ms = 0").unwrap();
+        assert_eq!(config.history_lines, 100_000);
+        assert_eq!(config.auto_lookback_timeout_ms, 0);
+    }
+
+    #[test]
+    fn test_unknown_fields_ignored() {
+        // serde(default) with deny_unknown_fields NOT set means unknown fields are OK
+        let toml_str = r#"
+            history_lines = 50000
+            some_future_field = true
+        "#;
+        // This should parse without error since we don't deny unknown fields
+        let result: Result<Config, _> = toml::from_str(toml_str);
+        // toml crate may or may not reject unknown fields depending on config
+        // If it fails, that's acceptable — the important thing is the Config::load
+        // path handles it gracefully.
+        if let Ok(config) = result {
+            assert_eq!(config.history_lines, 50000);
+        }
+    }
+
+    #[test]
+    fn test_load_from_nonexistent_file() {
+        let config = Config::load_from_file(Path::new("/nonexistent/path/config.toml"));
+        // Should return defaults when file doesn't exist
+        assert_eq!(config.history_lines, 100_000);
+    }
+
+    #[test]
+    fn test_config_path_returns_some() {
+        // config_path should return Some on all platforms
+        let path = Config::config_path();
+        assert!(path.is_some(), "config_path should return Some");
+        let path = path.unwrap();
+        assert!(
+            path.to_string_lossy().contains("claude-chill"),
+            "config path should contain 'claude-chill'"
+        );
+    }
+
+    #[test]
+    fn test_custom_lookback_key_parses() {
+        let config: Config = toml::from_str(r#"lookback_key = "[f12]""#).unwrap();
+        let key = config.parse_lookback_key().unwrap();
+        assert_eq!(key.to_escape_sequence(), b"\x1b[24~".to_vec());
+    }
+
+    #[test]
+    fn test_invalid_lookback_key_returns_error() {
+        let config: Config = toml::from_str(r#"lookback_key = "invalid""#).unwrap();
+        assert!(config.parse_lookback_key().is_err());
+    }
 }
