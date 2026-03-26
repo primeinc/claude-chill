@@ -74,6 +74,7 @@ impl VtRenderer {
 
     /// Compute the time until the next render should happen.
     /// Returns `None` if no render is pending or rendering is suppressed.
+    #[must_use]
     pub fn time_until_render(
         &self,
         in_lookback_mode: bool,
