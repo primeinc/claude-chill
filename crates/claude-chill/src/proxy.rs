@@ -1,9 +1,9 @@
 use crate::alt_screen::AltScreenTracker;
+#[cfg(test)]
+use crate::escape_sequences::ALT_SCREEN_ENTER;
 use crate::escape_sequences::{
     CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
-#[cfg(test)]
-use crate::escape_sequences::ALT_SCREEN_ENTER;
 use crate::history_filter::HistoryFilter;
 use crate::kitty_tracker::KittyTracker;
 use crate::line_buffer::LineBuffer;

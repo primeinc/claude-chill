@@ -669,4 +669,74 @@ mod tests {
         assert_eq!(original.code, reparsed.code);
         assert_eq!(original.modifiers, reparsed.modifiers);
     }
+
+    #[test]
+    fn test_display_roundtrip_all_special_keys() {
+        // Verify parse → Display → parse roundtrip for all special keys
+        let keys = [
+            "[enter]",
+            "[esc]",
+            "[tab]",
+            "[backspace]",
+            "[delete]",
+            "[insert]",
+            "[home]",
+            "[end]",
+            "[pageup]",
+            "[pagedown]",
+            "[up]",
+            "[down]",
+            "[left]",
+            "[right]",
+            "[space]",
+            "[f1]",
+            "[f6]",
+            "[f12]",
+            "[a]",
+            "[z]",
+            "[0]",
+            "[9]",
+        ];
+        for key_str in &keys {
+            let original = parse(key_str).unwrap();
+            let displayed = original.to_string();
+            let reparsed = parse(&displayed).unwrap_or_else(|e| {
+                panic!("roundtrip failed for {key_str}: displayed as '{displayed}', error: {e}")
+            });
+            assert_eq!(original.code, reparsed.code, "code mismatch for {key_str}");
+            assert_eq!(
+                original.modifiers, reparsed.modifiers,
+                "modifier mismatch for {key_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_display_roundtrip_with_modifiers() {
+        let combos = [
+            "[ctrl][a]",
+            "[shift][a]",
+            "[alt][a]",
+            "[ctrl][shift][a]",
+            "[ctrl][alt][a]",
+            "[shift][alt][a]",
+            "[ctrl][shift][alt][a]",
+            "[ctrl][f1]",
+            "[alt][enter]",
+            "[shift][tab]",
+            "[ctrl][space]",
+        ];
+        for key_str in &combos {
+            let original = parse(key_str).unwrap();
+            let displayed = original.to_string();
+            let reparsed = parse(&displayed).unwrap_or_else(|e| {
+                panic!("roundtrip failed for {key_str}: displayed as '{displayed}', error: {e}")
+            });
+            assert_eq!(original.code, reparsed.code, "code mismatch for {key_str}");
+            assert_eq!(
+                original.modifiers, reparsed.modifiers,
+                "modifier mismatch for {key_str}"
+            );
+        }
+    }
 }

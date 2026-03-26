@@ -212,4 +212,60 @@ mod tests {
         assert_eq!(tracker.stack, 0);
         assert!(!tracker.mode_enabled());
     }
+
+    #[test]
+    fn test_kitty_process_plain_text() {
+        let mut tracker = KittyTracker::new(true, 0);
+        tracker.process(b"Hello, World! This is plain text with no escape sequences.");
+        assert_eq!(tracker.stack, 0);
+        assert!(!tracker.mode_enabled());
+    }
+
+    #[test]
+    fn test_kitty_process_sgr_sequences() {
+        let mut tracker = KittyTracker::new(true, 0);
+        // SGR (color) sequences should not affect Kitty state
+        tracker.process(b"\x1b[1;31mBold Red\x1b[0m Normal");
+        assert_eq!(tracker.stack, 0);
+    }
+
+    #[test]
+    fn test_kitty_process_cursor_sequences() {
+        let mut tracker = KittyTracker::new(true, 0);
+        // Cursor movement should not affect Kitty state
+        tracker.process(b"\x1b[H\x1b[2J\x1b[10;20H");
+        assert_eq!(tracker.stack, 0);
+    }
+
+    #[test]
+    fn test_kitty_process_empty_data() {
+        let mut tracker = KittyTracker::new(true, 1);
+        tracker.process(b"");
+        assert_eq!(tracker.stack, 1);
+        assert!(tracker.mode_enabled());
+    }
+
+    #[test]
+    fn test_kitty_supported_getter() {
+        let tracker = KittyTracker::new(true, 0);
+        assert!(tracker.supported());
+        let tracker2 = KittyTracker::new(false, 0);
+        assert!(!tracker2.supported());
+    }
+
+    #[test]
+    fn test_kitty_deep_stack() {
+        let mut tracker = KittyTracker::new(true, 0);
+        // Push 10 times
+        for _ in 0..10 {
+            tracker.process(b"\x1b[>1u");
+        }
+        assert_eq!(tracker.stack, 10);
+        assert!(tracker.mode_enabled());
+
+        // Pop all at once
+        tracker.process(b"\x1b[<10u");
+        assert_eq!(tracker.stack, 0);
+        assert!(!tracker.mode_enabled());
+    }
 }
