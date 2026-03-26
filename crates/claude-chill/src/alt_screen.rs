@@ -69,19 +69,33 @@ impl AltScreenTracker {
     }
 
     /// Get the byte length of the enter sequence at the given position.
+    ///
+    /// # Panics (debug only)
+    /// Panics if `data` does not start with a recognized enter sequence.
     pub fn enter_len(&self, data: &[u8]) -> usize {
         if data.starts_with(ALT_SCREEN_ENTER) {
             ALT_SCREEN_ENTER.len()
         } else {
+            debug_assert!(
+                data.starts_with(ALT_SCREEN_ENTER_LEGACY),
+                "enter_len called on data not starting with an alt screen enter sequence"
+            );
             ALT_SCREEN_ENTER_LEGACY.len()
         }
     }
 
     /// Get the byte length of the exit sequence at the given position.
+    ///
+    /// # Panics (debug only)
+    /// Panics if `data` does not start with a recognized exit sequence.
     pub fn exit_len(&self, data: &[u8]) -> usize {
         if data.starts_with(ALT_SCREEN_EXIT) {
             ALT_SCREEN_EXIT.len()
         } else {
+            debug_assert!(
+                data.starts_with(ALT_SCREEN_EXIT_LEGACY),
+                "exit_len called on data not starting with an alt screen exit sequence"
+            );
             ALT_SCREEN_EXIT_LEGACY.len()
         }
     }
@@ -247,10 +261,12 @@ mod tests {
     }
 
     #[test]
-    fn test_enter_len_defaults_to_legacy_for_unknown() {
+    #[should_panic(expected = "enter_len called on data not starting with")]
+    fn test_enter_len_panics_for_unknown_in_debug() {
         let tracker = AltScreenTracker::new();
-        // If data doesn't start with the modern sequence, enter_len returns legacy length
-        assert_eq!(tracker.enter_len(b"garbage"), ALT_SCREEN_ENTER_LEGACY.len());
+        // Calling enter_len on data that isn't an alt screen sequence should
+        // panic in debug builds (debug_assert guards against misuse)
+        tracker.enter_len(b"garbage");
     }
 
     #[test]
