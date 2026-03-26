@@ -1,3 +1,5 @@
+//! TOML configuration file loading and defaults.
+
 use crate::key_parser::{self, KeyCombination};
 use serde::Deserialize;
 use std::fs;
@@ -6,6 +8,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 15000;
 
+/// User configuration loaded from `claude-chill.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
