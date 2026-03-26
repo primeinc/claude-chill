@@ -20,7 +20,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::openpty;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::Termios;
-use nix::unistd::{Pid, isatty, read};
+use nix::unistd::Pid;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -88,133 +88,6 @@ pub struct Proxy {
     output_buffer: Vec<u8>,
 }
 
-/// Pure decision: should we skip the Kitty keyboard protocol DA query?
-/// Returns true if the terminal is known not to support Kitty protocol.
-fn should_skip_kitty_query(term_program: Option<&str>, term: Option<&str>) -> bool {
-    if let Some(tp) = term_program {
-        let tp_lower = tp.to_ascii_lowercase();
-        if matches!(
-            tp_lower.as_str(),
-            "apple_terminal" | "terminal.app" | "iterm.app" | "iterm2" | "hyper" | "terminus"
-        ) {
-            return true;
-        }
-    }
-
-    if let Some(t) = term {
-        if matches!(t, "dumb" | "linux" | "vt100" | "vt220") {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Detect Kitty keyboard protocol support and return a configured KittyTracker.
-fn detect_kitty_support() -> KittyTracker {
-    // Skip the terminal query entirely if stdin isn't a TTY (e.g. piped input)
-    if !isatty(io::stdin()).unwrap_or(false) {
-        debug!("Kitty detection skipped: stdin is not a TTY");
-        return KittyTracker::new(false, 0);
-    }
-
-    let term_program = std::env::var("TERM_PROGRAM").ok();
-    let term = std::env::var("TERM").ok();
-
-    if should_skip_kitty_query(term_program.as_deref(), term.as_deref()) {
-        debug!(
-            "Kitty detection skipped: TERM_PROGRAM={} TERM={} (known non-Kitty)",
-            term_program.as_deref().unwrap_or("(unset)"),
-            term.as_deref().unwrap_or("(unset)")
-        );
-        return KittyTracker::new(false, 0);
-    }
-
-    let (supported, initial_flags) = query_kitty_support();
-    let initial_stack = if initial_flags > 0 { 1 } else { 0 };
-    KittyTracker::new(supported, initial_stack)
-}
-
-/// Returns (supported, initial_flags) - if flags > 0, terminal is already in Kitty mode
-fn query_kitty_support() -> (bool, u32) {
-    use std::io::Write;
-    use termwiz::escape::Action;
-    use termwiz::escape::csi::{CSI, Device, Keyboard};
-    use termwiz::escape::parser::Parser as TermwizParser;
-
-    // Query sequences:
-    // CSI ? u       - Kitty keyboard protocol query
-    // CSI c         - Primary Device Attributes (all terminals respond)
-    const KITTY_QUERY: &[u8] = b"\x1b[?u";
-    const DA_QUERY: &[u8] = b"\x1b[c";
-
-    // Send both queries
-    let stdout = std::io::stdout();
-    let mut stdout_lock = stdout.lock();
-    if stdout_lock.write_all(KITTY_QUERY).is_err() {
-        return (false, 0);
-    }
-    if stdout_lock.write_all(DA_QUERY).is_err() {
-        return (false, 0);
-    }
-    if stdout_lock.flush().is_err() {
-        return (false, 0);
-    }
-    drop(stdout_lock);
-
-    // Read responses with timeout using termwiz parser
-    let stdin = std::io::stdin();
-    let mut parser = TermwizParser::new();
-    let mut buf = [0u8; 256];
-    let mut kitty_supported = false;
-    let mut kitty_flags: u32 = 0;
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_millis(500);
-    let poll_interval = PollTimeout::from(50u16);
-
-    while start.elapsed() < timeout {
-        let mut poll_fd = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
-
-        match poll(&mut poll_fd, poll_interval) {
-            Ok(0) => continue,
-            Ok(_) => {
-                match read(stdin.as_fd(), &mut buf) {
-                    Ok(0) => continue,
-                    Ok(n) => {
-                        let actions = parser.parse_as_vec(&buf[..n]);
-                        for action in actions {
-                            if let Action::CSI(csi) = action {
-                                match csi {
-                                    CSI::Keyboard(Keyboard::ReportKittyState(flags)) => {
-                                        kitty_supported = true;
-                                        kitty_flags = u32::from(flags.bits());
-                                    }
-                                    CSI::Device(dev)
-                                        if matches!(*dev, Device::DeviceAttributes(_)) =>
-                                    {
-                                        // DA response means all responses received
-                                        debug!(
-                                            "Kitty detection complete: supported={kitty_supported} flags={kitty_flags}"
-                                        );
-                                        return (kitty_supported, kitty_flags);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => continue,
-                    Err(_) => break,
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-
-    debug!("Kitty detection timed out, supported={kitty_supported} flags={kitty_flags}");
-    (kitty_supported, kitty_flags)
-}
-
 impl Proxy {
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
         let winsize = get_terminal_size()?;
@@ -224,7 +97,7 @@ impl Proxy {
         setup_signal_handlers()?;
 
         // Detect Kitty support before spawning child
-        let kitty_tracker = detect_kitty_support();
+        let kitty_tracker = crate::kitty_tracker::detect();
 
         let slave_fd = pty.slave.as_raw_fd();
 
@@ -1506,97 +1379,5 @@ mod tests {
             text.contains("sync content before alt"),
             "pre-alt sync content should be in history"
         );
-    }
-
-    // ================================================================
-    // Kitty detection skip logic tests
-    // ================================================================
-
-    #[test]
-    fn test_skip_kitty_apple_terminal() {
-        assert!(should_skip_kitty_query(Some("Apple_Terminal"), None));
-    }
-
-    #[test]
-    fn test_skip_kitty_terminal_app() {
-        assert!(should_skip_kitty_query(Some("Terminal.app"), None));
-    }
-
-    #[test]
-    fn test_skip_kitty_iterm2() {
-        assert!(should_skip_kitty_query(Some("iTerm2"), None));
-        assert!(should_skip_kitty_query(Some("iTerm.app"), None));
-    }
-
-    #[test]
-    fn test_skip_kitty_hyper() {
-        assert!(should_skip_kitty_query(Some("Hyper"), None));
-    }
-
-    #[test]
-    fn test_skip_kitty_terminus() {
-        assert!(should_skip_kitty_query(Some("Terminus"), None));
-    }
-
-    #[test]
-    fn test_skip_kitty_dumb_term() {
-        assert!(should_skip_kitty_query(None, Some("dumb")));
-    }
-
-    #[test]
-    fn test_skip_kitty_linux_console() {
-        assert!(should_skip_kitty_query(None, Some("linux")));
-    }
-
-    #[test]
-    fn test_skip_kitty_vt100() {
-        assert!(should_skip_kitty_query(None, Some("vt100")));
-        assert!(should_skip_kitty_query(None, Some("vt220")));
-    }
-
-    #[test]
-    fn test_no_skip_kitty_known_supporters() {
-        // Kitty, Ghostty, WezTerm should NOT be skipped
-        assert!(!should_skip_kitty_query(Some("kitty"), None));
-        assert!(!should_skip_kitty_query(Some("ghostty"), None));
-        assert!(!should_skip_kitty_query(Some("WezTerm"), None));
-    }
-
-    #[test]
-    fn test_no_skip_kitty_xterm256() {
-        assert!(!should_skip_kitty_query(None, Some("xterm-256color")));
-    }
-
-    #[test]
-    fn test_no_skip_kitty_unset() {
-        assert!(!should_skip_kitty_query(None, None));
-    }
-
-    #[test]
-    fn test_skip_kitty_case_insensitive_term_program() {
-        // TERM_PROGRAM check should be case-insensitive
-        assert!(should_skip_kitty_query(Some("APPLE_TERMINAL"), None));
-        assert!(should_skip_kitty_query(Some("apple_terminal"), None));
-        assert!(should_skip_kitty_query(Some("ITERM2"), None));
-    }
-
-    #[test]
-    fn test_skip_kitty_term_program_takes_priority() {
-        // If TERM_PROGRAM is a known non-Kitty, skip even with a good TERM
-        assert!(should_skip_kitty_query(
-            Some("Apple_Terminal"),
-            Some("xterm-256color")
-        ));
-    }
-
-    #[test]
-    fn test_no_skip_kitty_unknown_term_program() {
-        // Unknown TERM_PROGRAM with basic TERM → skip (due to TERM)
-        assert!(should_skip_kitty_query(Some("SomeUnknown"), Some("dumb")));
-        // Unknown TERM_PROGRAM with good TERM → don't skip
-        assert!(!should_skip_kitty_query(
-            Some("SomeUnknown"),
-            Some("xterm-256color")
-        ));
     }
 }
