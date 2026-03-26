@@ -844,4 +844,26 @@ mod tests {
             "slow path should strip unsafe sequences"
         );
     }
+
+    #[test]
+    fn test_fast_path_returns_borrowed() {
+        let mut filter = HistoryFilter::new();
+        let input = b"plain text with \x1b[31mcolors\x1b[0m";
+        let output = filter.filter(input.as_slice());
+        assert!(
+            matches!(output, Cow::Borrowed(_)),
+            "fast path should return Cow::Borrowed, got Cow::Owned"
+        );
+    }
+
+    #[test]
+    fn test_slow_path_returns_owned() {
+        let mut filter = HistoryFilter::new();
+        let input = b"text\x1b[?1004hmore"; // contains blacklisted focus tracking
+        let output = filter.filter(input.as_slice());
+        assert!(
+            matches!(output, Cow::Owned(_)),
+            "slow path should return Cow::Owned, got Cow::Borrowed"
+        );
+    }
 }
