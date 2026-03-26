@@ -5,7 +5,7 @@
 ![Version](https://img.shields.io/badge/version-0.1.4-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-green)
 ![macOS](https://img.shields.io/badge/macOS-supported-green)
-![Windows](https://img.shields.io/badge/Windows-unsupported-red)
+![Windows](https://img.shields.io/badge/Windows-supported-green)
 ![Rust](https://img.shields.io/badge/rust-2024-orange)
 
 A PTY proxy that tames Claude Code's massive terminal updates using VT-based rendering.
