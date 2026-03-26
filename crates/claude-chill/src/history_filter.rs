@@ -868,6 +868,28 @@ mod tests {
     }
 
     #[test]
+    fn test_stateful_parser_across_chunks() {
+        // Verify that the filter handles escape sequences split across calls.
+        // The parser is stateful, so a partial ESC in one call should be
+        // completed in the next call.
+        let mut filter = HistoryFilter::new();
+
+        // Chunk 1: text ending with partial ESC sequence (SGR bold)
+        let chunk1 = b"Hello\x1b[1";
+        let out1 = filter.filter(chunk1);
+        // The partial ESC won't produce a complete action, so the parser
+        // buffers it. "Hello" should be in the output.
+        let s1 = String::from_utf8_lossy(out1.as_ref());
+        assert!(s1.contains("Hello"), "chunk1 should contain text");
+
+        // Chunk 2: completes the SGR sequence and adds more text
+        let chunk2 = b"mBold\x1b[0m";
+        let out2 = filter.filter(chunk2);
+        let s2 = String::from_utf8_lossy(out2.as_ref());
+        assert!(s2.contains("Bold"), "chunk2 should contain continuation text");
+    }
+
+    #[test]
     fn test_empty_input() {
         let mut filter = HistoryFilter::new();
         let output = filter.filter(b"");
