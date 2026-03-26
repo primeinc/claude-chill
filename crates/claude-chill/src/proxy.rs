@@ -275,29 +275,17 @@ impl Proxy {
     }
 
     fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
-        self.process_output_inner(data, stdout_fd, true)
-    }
-
-    fn process_output_inner<F: AsFd>(
-        &mut self,
-        data: &[u8],
-        stdout_fd: &F,
-        feed_vt: bool,
-    ) -> Result<()> {
         debug!(
-            "process_output: len={} in_alt={} in_lookback={} feed_vt={}",
+            "process_output: len={} in_alt={} in_lookback={}",
             data.len(),
             self.alt_screen.in_alternate_screen(),
             self.in_lookback_mode,
-            feed_vt
         );
 
         if self.alt_screen.in_alternate_screen() {
-            // Feed VT but NOT history while in alt screen
-            // Alt screen content (TUI editors, etc.) shouldn't be in lookback history
-            if feed_vt {
-                self.renderer.process(data);
-            }
+            // Feed VT for screen tracking but skip history (alt screen content
+            // like TUI editors shouldn't appear in lookback)
+            self.renderer.process(data);
             return self.process_output_alt_screen(data, stdout_fd);
         }
 
@@ -307,10 +295,7 @@ impl Proxy {
             return Ok(());
         }
 
-        // Feed data to VT emulator (unless already fed by caller)
-        if feed_vt {
-            self.renderer.process(data);
-        }
+        self.renderer.process(data);
         self.renderer.mark_pending();
 
         // Process sync blocks for history management, watching for alt screen enter
