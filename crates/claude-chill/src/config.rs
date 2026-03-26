@@ -32,6 +32,7 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Load configuration from the platform config directory, falling back to defaults.
     pub fn load() -> Self {
         let config_path = Self::config_path();
         match config_path {
@@ -40,6 +41,7 @@ impl Config {
         }
     }
 
+    /// Return the platform-specific path to the config file.
     pub fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("claude-chill.toml"))
     }
@@ -68,6 +70,7 @@ impl Config {
         }
     }
 
+    /// Parse the configured lookback key string into a [`KeyCombination`].
     pub fn parse_lookback_key(&self) -> Result<KeyCombination, key_parser::ParseKeyError> {
         key_parser::parse(&self.lookback_key)
     }
