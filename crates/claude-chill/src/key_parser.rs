@@ -450,4 +450,111 @@ mod tests {
         let key = parse("[ctrl][\\]").unwrap();
         assert_eq!(key.to_escape_sequence(), vec![0x1C]);
     }
+
+    // ====================================================================
+    // Kitty keyboard protocol sequence tests
+    // ====================================================================
+
+    #[test]
+    fn test_kitty_simple_char() {
+        let key = parse("[a]").unwrap();
+        // 'a' = codepoint 97, no modifiers → \x1b[97u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[97u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_char() {
+        let key = parse("[ctrl][c]").unwrap();
+        // 'c' = codepoint 99, ctrl = modifier 5 → \x1b[99;5u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[99;5u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_6_default_lookback() {
+        let key = parse("[ctrl][6]").unwrap();
+        // '6' = codepoint 54, ctrl = modifier 5 → \x1b[54;5u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[54;5u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_shift_char() {
+        let key = parse("[shift][a]").unwrap();
+        // 'a' = 97, shift = modifier 2 → \x1b[97;2u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[97;2u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_alt_char() {
+        let key = parse("[alt][x]").unwrap();
+        // 'x' = 120, alt = modifier 3 → \x1b[120;3u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[120;3u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_shift_char() {
+        let key = parse("[ctrl][shift][j]").unwrap();
+        // 'j' = 106, ctrl+shift = 1+1+4 = modifier 6 → \x1b[106;6u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[106;6u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_all_modifiers() {
+        let key = parse("[ctrl][shift][alt][a]").unwrap();
+        // ctrl+shift+alt = 1+1+2+4 = modifier 8 → \x1b[97;8u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[97;8u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_enter() {
+        let key = parse("[enter]").unwrap();
+        // Enter = codepoint 13, no modifiers → \x1b[13u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[13u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_escape() {
+        let key = parse("[esc]").unwrap();
+        // Esc = codepoint 27, no modifiers → \x1b[27u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[27u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_tab() {
+        let key = parse("[tab]").unwrap();
+        // Tab = codepoint 9, no modifiers → \x1b[9u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[9u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_space() {
+        let key = parse("[space]").unwrap();
+        // Space = codepoint 32, no modifiers → \x1b[32u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[32u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_backspace() {
+        let key = parse("[backspace]").unwrap();
+        // Backspace = codepoint 127, no modifiers → \x1b[127u
+        assert_eq!(key.to_kitty_sequence(), Some(b"\x1b[127u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_f_key_unsupported() {
+        // Function keys don't have Kitty codepoints in the current implementation
+        let key = parse("[f12]").unwrap();
+        assert_eq!(key.to_kitty_sequence(), None);
+    }
+
+    #[test]
+    fn test_kitty_arrow_unsupported() {
+        let key = parse("[up]").unwrap();
+        assert_eq!(key.to_kitty_sequence(), None);
+    }
+
+    #[test]
+    fn test_kitty_pageup_unsupported() {
+        let key = parse("[pageup]").unwrap();
+        assert_eq!(key.to_kitty_sequence(), None);
+    }
 }

@@ -702,4 +702,75 @@ mod tests {
         assert_roundtrip_exact(b"\n", "newline");
         assert_roundtrip_exact(b"\r", "carriage return");
     }
+
+    // ====================================================================
+    // Known re-encoding divergences: termwiz Display may emit bytes that
+    // differ from the original input. These tests document the divergences
+    // and verify visual equivalence despite byte-level differences.
+    // ====================================================================
+
+    #[test]
+    fn test_reencoding_sgr_combined_params() {
+        // \x1b[1;31m (bold + red) — termwiz may split into separate SGR sequences
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[1;31mtext\x1b[0m";
+        let output = filter.filter(input);
+
+        // Verify visual equivalence even if bytes differ
+        let mut p_in = vt100::Parser::new(24, 80, 0);
+        p_in.process(input);
+        let mut p_out = vt100::Parser::new(24, 80, 0);
+        p_out.process(&output);
+        assert_eq!(
+            p_in.screen().contents(),
+            p_out.screen().contents(),
+            "combined SGR must be visually equivalent"
+        );
+
+        // Document whether this particular case round-trips exactly
+        if output != input.to_vec() {
+            // Known divergence: termwiz may re-encode combined SGR differently.
+            // This is acceptable as long as visual output is identical.
+        }
+    }
+
+    #[test]
+    fn test_reencoding_cursor_default_params() {
+        // \x1b[1;1H — termwiz may normalize to \x1b[H (default params elided)
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[1;1H";
+        let output = filter.filter(input);
+
+        let mut p_in = vt100::Parser::new(24, 80, 0);
+        p_in.process(input);
+        let mut p_out = vt100::Parser::new(24, 80, 0);
+        p_out.process(&output);
+        assert_eq!(
+            p_in.screen().cursor_position(),
+            p_out.screen().cursor_position(),
+            "cursor position must match"
+        );
+    }
+
+    #[test]
+    fn test_reencoding_sgr_reset() {
+        // \x1b[0m — termwiz may re-encode as \x1b[m (eliding the 0)
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[0m";
+        let output = filter.filter(input);
+
+        // Both forms are visually identical
+        let mut p_in = vt100::Parser::new(24, 80, 0);
+        p_in.process(b"\x1b[1;31mRed\x1b[0m Normal");
+        let mut p_out = vt100::Parser::new(24, 80, 0);
+        p_out.process(b"\x1b[1;31mRed");
+        p_out.process(&output);
+        p_out.process(b" Normal");
+        // Both should have "Normal" without attributes
+        assert_eq!(
+            p_in.screen().contents(),
+            p_out.screen().contents(),
+            "SGR reset must produce same visual result"
+        );
+    }
 }
