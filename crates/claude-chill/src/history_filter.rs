@@ -886,7 +886,10 @@ mod tests {
         let chunk2 = b"mBold\x1b[0m";
         let out2 = filter.filter(chunk2);
         let s2 = String::from_utf8_lossy(out2.as_ref());
-        assert!(s2.contains("Bold"), "chunk2 should contain continuation text");
+        assert!(
+            s2.contains("Bold"),
+            "chunk2 should contain continuation text"
+        );
     }
 
     #[test]
