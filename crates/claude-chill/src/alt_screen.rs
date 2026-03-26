@@ -14,6 +14,7 @@ pub struct AltScreenTracker {
 }
 
 impl AltScreenTracker {
+    /// Create a new tracker, starting in the normal screen.
     pub fn new() -> Self {
         Self {
             in_alternate_screen: false,
@@ -24,10 +25,12 @@ impl AltScreenTracker {
         }
     }
 
+    /// Whether the terminal is currently in the alternate screen buffer.
     pub fn in_alternate_screen(&self) -> bool {
         self.in_alternate_screen
     }
 
+    /// Set the alternate screen state directly.
     pub fn set_alternate_screen(&mut self, active: bool) {
         self.in_alternate_screen = active;
     }

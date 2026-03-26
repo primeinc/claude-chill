@@ -1,6 +1,7 @@
 use memchr::memchr;
 use std::collections::VecDeque;
 
+/// Line-oriented ring buffer that retains the last N lines of byte data.
 pub struct LineBuffer {
     lines: VecDeque<Vec<u8>>,
     current_line: Vec<u8>,
@@ -9,6 +10,7 @@ pub struct LineBuffer {
 }
 
 impl LineBuffer {
+    /// Create a buffer that retains at most `max_lines` completed lines.
     pub fn new(max_lines: usize) -> Self {
         // Pre-allocate for typical initial growth; caps at max_lines.
         let initial_capacity = max_lines.min(1024);
@@ -20,6 +22,7 @@ impl LineBuffer {
         }
     }
 
+    /// Append a single byte, committing the current line on `\n`.
     pub fn push_byte(&mut self, byte: u8) {
         if byte == b'\n' {
             self.commit_line();
@@ -28,6 +31,7 @@ impl LineBuffer {
         }
     }
 
+    /// Append a slice of bytes, splitting on `\n` and evicting old lines.
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         let mut pos = 0;
         while pos < bytes.len() {
@@ -56,20 +60,24 @@ impl LineBuffer {
         }
     }
 
+    /// Discard all buffered content.
     pub fn clear(&mut self) {
         self.lines.clear();
         self.current_line.clear();
         self.cached_bytes = 0;
     }
 
+    /// Number of lines currently buffered (including any partial line).
     pub fn line_count(&self) -> usize {
         self.lines.len() + if self.current_line.is_empty() { 0 } else { 1 }
     }
 
+    /// Total bytes across all buffered lines and the current partial line.
     pub fn total_bytes(&self) -> usize {
         self.cached_bytes + self.current_line.len()
     }
 
+    /// Append the last `n` lines (including any partial line) to `output`.
     pub fn append_last_n_lines(&self, n: usize, output: &mut Vec<u8>) {
         let total_lines = self.line_count();
         let lines_to_skip = total_lines.saturating_sub(n);
@@ -84,6 +92,7 @@ impl LineBuffer {
         }
     }
 
+    /// Append all buffered content to `output`.
     pub fn append_all(&self, output: &mut Vec<u8>) {
         for line in &self.lines {
             output.extend_from_slice(line);

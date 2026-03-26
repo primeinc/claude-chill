@@ -26,6 +26,7 @@ pub enum OutputSegment<'a> {
 }
 
 impl SyncBlockParser {
+    /// Create a new parser with pre-compiled byte finders for sync markers.
     pub fn new() -> Self {
         Self {
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
