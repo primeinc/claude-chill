@@ -5,6 +5,7 @@
 //! (portable-pty spawns a ConPTY, proxy creates another ConPTY) causes deadlocks.
 //! The piped approach tests the ConPTY child output path but not interactive stdin.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -64,6 +65,31 @@ fn run_proxy_with_command(shell_cmd: &str) -> (String, Option<i32>) {
     (stdout, code)
 }
 
+/// Spawn the proxy wrapping the argv `child`, write `input` to the proxy's
+/// stdin, then close it. Returns (stdout, exit_code).
+fn run_proxy_with_stdin(child: &[&str], input: &[u8]) -> (String, Option<i32>) {
+    let bin = binary_path();
+    let mut args: Vec<&str> = vec!["-a", "0", "--"];
+    args.extend_from_slice(child);
+
+    let mut proc = Command::new(&bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to run {bin:?}: {e}"));
+    {
+        let mut stdin = proc.stdin.take().expect("stdin is piped");
+        stdin.write_all(input).expect("write to proxy stdin");
+    }
+    let output = proc.wait_with_output().expect("wait for proxy");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output.status.code(),
+    )
+}
+
 #[test]
 fn test_e2e_echo_output() {
     let (stdout, code) = run_proxy_with_command("echo HELLO_E2E_TEST");
@@ -100,6 +126,26 @@ fn test_e2e_multiple_lines() {
 }
 
 #[test]
+fn test_e2e_piped_stdin_reaches_child() {
+    // Redirected stdin is forwarded to the child, and its EOF does not end
+    // the proxy before the child's output is relayed.
+    let (child, input): (&[&str], &[u8]) = if cfg!(windows) {
+        (
+            &["cmd.exe", "/c", "set /p X=& call echo GOT_%X%"],
+            b"piped\r",
+        )
+    } else {
+        (&["/bin/sh", "-c", "read X; echo GOT_$X"], b"piped\n")
+    };
+    let (stdout, code) = run_proxy_with_stdin(child, input);
+    assert!(
+        stdout.contains("GOT_piped"),
+        "Child did not receive piped stdin.\nGot:\n{stdout}"
+    );
+    assert_eq!(code, Some(0));
+}
+
+#[test]
 fn test_e2e_empty_output() {
     // A command that produces no visible output
     let cmd = if cfg!(windows) {
@@ -120,14 +166,22 @@ fn test_e2e_large_output() {
         "seq 1 100 | while read i; do echo Line number $i; done"
     };
     let (stdout, code) = run_proxy_with_command(cmd);
+    // ConPTY re-renders the child's screen, so on Windows the stream holds
+    // cursor-addressed screen updates, not the child's bytes: check what a
+    // 24x80 terminal (the proxy's fallback size) shows at the end.
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    screen.process(stdout.as_bytes());
+    let shown = screen.screen().contents();
     assert!(
-        stdout.contains("Line number 1"),
-        "Missing first line in:\n{stdout}"
+        shown.contains("Line number 100"),
+        "Missing last line on the final screen:\n{shown}\nStream:\n{stdout}"
     );
-    assert!(
-        stdout.contains("Line number 100"),
-        "Missing last line in:\n{stdout}"
-    );
+    if !cfg!(windows) {
+        assert!(
+            stdout.contains("Line number 1\r\n") || stdout.contains("Line number 1\n"),
+            "Missing first line in:\n{stdout}"
+        );
+    }
     assert_eq!(code, Some(0));
 }
 

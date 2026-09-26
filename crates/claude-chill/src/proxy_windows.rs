@@ -30,14 +30,15 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+    COORD, ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, HPCON, ResizePseudoConsole,
+    STD_INPUT_HANDLE,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// PTY proxy using Windows ConPTY for pseudo-console support.
@@ -212,7 +213,6 @@ impl Proxy {
     /// on a separate thread." The output pipe is read on a background thread
     /// and sent to the main loop via a channel.
     pub fn run(&mut self) -> Result<i32> {
-        let mut buf = [0u8; 65536];
         let mut stdout = io::stdout();
 
         // Spawn a background thread to read from the ConPTY output pipe.
@@ -252,6 +252,45 @@ impl Proxy {
             }
         });
 
+        // stdin gets its own blocking reader thread too. A console ReadFile
+        // waits for key input (resize and focus records do not complete it),
+        // so on the event loop it stalls output. A redirected stdin (pipe,
+        // file, NUL) is not a console, and only ReadFile drains it and sees
+        // its EOF. The thread ends at EOF or on a read error; it is never
+        // joined, because a console read cannot be cancelled and process exit
+        // ends it.
+        // SAFETY: GetStdHandle returns this process's stdin handle, valid for
+        // the life of the process. Transferred as usize like the output pipe.
+        let stdin_handle_raw = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
+        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+        std::thread::spawn(move || {
+            let stdin_handle = stdin_handle_raw as HANDLE;
+            let mut read_buf = vec![0u8; 4096];
+            loop {
+                let mut bytes_read: u32 = 0;
+                // SAFETY: stdin_handle is the process stdin handle; read_buf is
+                // valid for its length; bytes_read receives the count.
+                let ok = unsafe {
+                    ReadFile(
+                        stdin_handle,
+                        read_buf.as_mut_ptr(),
+                        read_buf.len() as u32,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || bytes_read == 0 {
+                    break; // EOF, closed pipe, or no usable stdin
+                }
+                if input_tx
+                    .send(read_buf[..bytes_read as usize].to_vec())
+                    .is_err()
+                {
+                    break; // Main thread dropped the receiver
+                }
+            }
+        });
+
         loop {
             // Check for signals
             if SIGTERM_RECEIVED.swap(false, Ordering::SeqCst) {
@@ -282,8 +321,10 @@ impl Proxy {
                 got_output = true;
             }
 
-            // Check for stdin input (non-blocking via GetNumberOfConsoleInputEvents)
-            self.poll_stdin(&mut buf, &mut stdout)?;
+            // Forward stdin read by the input thread (non-blocking)
+            while let Ok(data) = input_rx.try_recv() {
+                self.process_input(&data, &mut stdout)?;
+            }
 
             // Check auto-lookback
             if !got_output {
@@ -337,44 +378,6 @@ impl Proxy {
         }
 
         self.wait_child()
-    }
-
-    fn poll_stdin(&mut self, buf: &mut [u8], stdout: &mut io::Stdout) -> Result<()> {
-        use windows_sys::Win32::System::Console::{
-            GetNumberOfConsoleInputEvents, GetStdHandle, STD_INPUT_HANDLE,
-        };
-        // SAFETY: GetStdHandle returns a pseudo-handle for stdin.
-        let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-        let mut num_events: u32 = 0;
-
-        // GetNumberOfConsoleInputEvents is non-blocking and tells us if there's
-        // input waiting. Only call ReadFile if there IS input, to avoid blocking.
-        // SAFETY: stdin_handle is valid, num_events is a valid out-pointer.
-        if unsafe { GetNumberOfConsoleInputEvents(stdin_handle, &mut num_events) } == 0 {
-            // Not a console handle (e.g., piped input) — skip
-            return Ok(());
-        }
-        if num_events == 0 {
-            return Ok(());
-        }
-
-        let mut bytes_read: u32 = 0;
-        // SAFETY: stdin_handle is valid, buf is a valid buffer with sufficient length,
-        // bytes_read receives the actual count. ReadFile is safe for console input
-        // when events are available (checked above).
-        let ok = unsafe {
-            ReadFile(
-                stdin_handle,
-                buf.as_mut_ptr(),
-                buf.len().min(4096) as u32,
-                &mut bytes_read,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok != 0 && bytes_read > 0 {
-            self.process_input(&buf[..bytes_read as usize], stdout)?;
-        }
-        Ok(())
     }
 
     fn process_output(&mut self, data: &[u8], stdout: &mut io::Stdout) -> Result<()> {
@@ -812,6 +815,14 @@ fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(
     // SAFETY: zeroed memory is valid for STARTUPINFOEXW and PROCESS_INFORMATION.
     let mut startup_info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Invalid std handles, so the child attaches to the pseudo-console. Without
+    // STARTF_USESTDHANDLES a child inherits this process's redirected stdio:
+    // it writes straight to our stdout pipe and reads our stdin pipe, bypassing
+    // ConPTY. Same as wezterm pty/src/win/pseudocon.rs spawn_command.
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     startup_info.lpAttributeList = attr_list;
 
     // SAFETY: PROCESS_INFORMATION is a plain C struct; zeroed is valid.
