@@ -1,14 +1,12 @@
 # cargo-deny configuration
 # https://embarkstudios.github.io/cargo-deny/
+# Vulnerability advisories always fail the check. Licenses outside `allow` fail it.
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "workspace"
 yanked = "warn"
-notice = "warn"
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -23,7 +21,6 @@ allow = [
     "Zlib",
     "WTFPL",
 ]
-copyleft = "deny"
 
 [bans]
 multiple-versions = "warn"
