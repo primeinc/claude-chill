@@ -89,11 +89,11 @@ claude-chill -k "[f12]" claude
 # Disable auto-lookback (see below)
 claude-chill -a 0 claude
 
-# Enable debug logging to stderr
-claude-chill -v claude
+# Enable debug logging to stderr, redirected to a file (see Troubleshooting)
+claude-chill -v claude 2> claude-chill.log
 
 # Or use RUST_LOG for granular control
-RUST_LOG=claude_chill=debug claude-chill claude
+RUST_LOG=claude_chill=debug claude-chill claude 2> claude-chill.log
 
 # Combine options with claude arguments
 claude-chill -H 50000 -a 0 -- claude --verbose
@@ -209,16 +209,19 @@ Enable debug logging to diagnose issues:
 
 ```bash
 # Quick verbose mode
-claude-chill -v claude
+claude-chill -v claude 2> claude-chill.log
 
 # Granular control via RUST_LOG
-RUST_LOG=claude_chill=debug claude-chill claude
+RUST_LOG=claude_chill=debug claude-chill claude 2> claude-chill.log
 
 # Or set in config for persistent logging
 # Add `verbose = true` to your claude-chill.toml
 ```
 
-Debug output goes to stderr, so it won't interfere with the terminal proxy.
+Logs go to stderr. In an interactive session stderr is normally the same
+terminal the proxy is rendering to, so unredirected log lines land between
+render frames and corrupt the screen: redirect stderr to a file as above.
+Logs record byte counts, never the bytes you type.
 
 ## Security
 

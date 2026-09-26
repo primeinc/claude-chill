@@ -11,7 +11,8 @@ When filing a bug report, please include:
    $ claude-chill --version
    claude-chill 0.1.5 (b73342e)
    ```
-2. Debug logs from `claude-chill -v <your command>` (logs go to stderr)
+2. Debug logs from `claude-chill -v <your command> 2> claude-chill.log`
+   (logs go to stderr; redirect them so they don't draw over the screen)
 
 ## Branch Naming
 

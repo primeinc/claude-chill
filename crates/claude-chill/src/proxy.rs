@@ -489,7 +489,9 @@ impl Proxy {
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
-        debug!("process_input: stdin={data:?}");
+        // Byte count only: stdin carries passwords and tokens typed at no-echo
+        // prompts, and --verbose logs in release builds.
+        debug!("process_input: {} bytes", data.len());
 
         if self.alt_screen.in_alternate_screen() {
             return write_all(&self.pty_master, data);

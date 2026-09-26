@@ -50,8 +50,11 @@ pub struct Proxy {
     child_thread: HANDLE,
     pipe_input_write: HANDLE, // Write end: our input → child's stdin
     pipe_output_read: HANDLE, // Read end: child's stdout → our output
+    // Queue to the thread that writes pipe_input_write; set by run().
+    pty_input_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    pty_writer: Option<std::thread::JoinHandle<()>>,
     // Held for its Drop, which restores the console modes.
-    _console_mode: Option<ConsoleMode>,
+    _console_mode: ConsoleMode,
 
     // VT rendering
     renderer: VtRenderer,
@@ -165,7 +168,21 @@ impl Proxy {
         // We'll close them after spawning the child.
 
         // Prepare startup info with ConPTY attribute
-        let (child_process, child_thread) = create_child_process(conpty, command, args)?;
+        let (child_process, child_thread) = match create_child_process(conpty, command, args) {
+            Ok(handles) => handles,
+            Err(e) => {
+                // SAFETY: conpty and all four pipe handles are valid and owned
+                // only here; nothing else holds them until Self is built.
+                unsafe {
+                    ClosePseudoConsole(conpty);
+                    CloseHandle(pipe_input_read);
+                    CloseHandle(pipe_input_write);
+                    CloseHandle(pipe_output_read);
+                    CloseHandle(pipe_output_write);
+                }
+                return Err(e);
+            }
+        };
 
         // Per MS docs: "Upon completion of the CreateProcess call, the handles given
         // during creation should be freed from this process."
@@ -203,6 +220,8 @@ impl Proxy {
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(crate::escape_sequences::OUTPUT_BUFFER_CAPACITY),
             last_terminal_size: winsize,
+            pty_input_tx: None,
+            pty_writer: None,
         })
     }
 
@@ -293,6 +312,41 @@ impl Proxy {
                 }
             }
         });
+
+        // ConPTY input is written on its own thread as well. WriteFile blocks
+        // while the child is not reading its input; on the event loop that
+        // stops output draining, and with the bounded output channel a child
+        // blocked writing output and a proxy blocked writing input deadlock.
+        // The queue holds what arrived on stdin plus what the proxy generates
+        // (lookback keys, Ctrl+C). Drop joins this thread.
+        let pipe_input_raw = self.pipe_input_write as usize;
+        let (pty_input_tx, pty_input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        self.pty_input_tx = Some(pty_input_tx);
+        self.pty_writer = Some(std::thread::spawn(move || {
+            let pipe_input_write = pipe_input_raw as HANDLE;
+            for data in pty_input_rx {
+                let mut offset = 0;
+                while offset < data.len() {
+                    let mut written: u32 = 0;
+                    // SAFETY: pipe_input_write is the input pipe's write handle,
+                    // transferred as usize; Proxy::drop closes it only after
+                    // joining this thread. data is valid for the given length.
+                    let ok = unsafe {
+                        WriteFile(
+                            pipe_input_write,
+                            data[offset..].as_ptr(),
+                            (data.len() - offset) as u32,
+                            &mut written,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if ok == 0 {
+                        return; // Pipe broken: ConPTY closed or child gone
+                    }
+                    offset += written as usize;
+                }
+            }
+        }));
 
         loop {
             // Check for signals
@@ -488,25 +542,14 @@ impl Proxy {
         Ok(())
     }
 
+    /// Queue bytes for the ConPTY input writer thread. A send only fails once
+    /// the writer has stopped on a broken pipe (the child or ConPTY is gone),
+    /// and the event loop then ends on child exit.
     fn write_to_pty(&self, data: &[u8]) -> Result<()> {
-        let mut written: u32 = 0;
-        let mut offset = 0;
-        while offset < data.len() {
-            // SAFETY: pipe_input_write is a valid write handle from CreatePipe,
-            // data slice is valid for the given length, written receives byte count.
-            let ok = unsafe {
-                WriteFile(
-                    self.pipe_input_write,
-                    data[offset..].as_ptr(),
-                    (data.len() - offset) as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                anyhow::bail!("WriteFile to PTY failed: {}", io::Error::last_os_error());
-            }
-            offset += written as usize;
+        if let Some(tx) = &self.pty_input_tx
+            && tx.send(data.to_vec()).is_err()
+        {
+            debug!("write_to_pty: writer stopped, dropped {} bytes", data.len());
         }
         Ok(())
     }
@@ -691,14 +734,23 @@ impl Proxy {
 
 impl Drop for Proxy {
     fn drop(&mut self) {
-        // SAFETY: All handles were obtained from Win32 API calls during spawn().
-        // conpty may have been set to 0 in run() to prevent double-close.
-        // CloseHandle is idempotent-safe for valid handles.
+        // SAFETY: conpty is a valid HPCON unless run() already closed it and
+        // set it to 0.
         unsafe {
-            // conpty may have been closed already in run() — check for null
             if self.conpty != 0 {
                 ClosePseudoConsole(self.conpty);
             }
+        }
+        // The pseudo-console is closed, so a write blocked on the input pipe
+        // fails; dropping the sender ends an idle writer. Join before closing
+        // the handle it writes to.
+        self.pty_input_tx = None;
+        if let Some(writer) = self.pty_writer.take() {
+            let _ = writer.join();
+        }
+        // SAFETY: All handles were obtained from Win32 API calls during spawn(),
+        // and no thread uses them any more.
+        unsafe {
             CloseHandle(self.pipe_input_write);
             CloseHandle(self.pipe_output_read);
             CloseHandle(self.child_process);
@@ -788,8 +840,10 @@ fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(
         InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_list_size);
     }
 
-    let attr_list_buf = vec![0u8; attr_list_size];
-    let attr_list = attr_list_buf.as_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    // Written by InitializeProcThreadAttributeList, so the pointer must come
+    // from as_mut_ptr.
+    let mut attr_list_buf = vec![0u8; attr_list_size];
+    let attr_list = attr_list_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
 
     // SAFETY: attr_list points to a buffer of the size requested by the first call.
     if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size) } == 0 {

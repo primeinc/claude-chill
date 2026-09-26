@@ -23,20 +23,16 @@ pub static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 /// stdout's when it is a console (VT processing is turned on there). Dropping
 /// it on any early return from `Proxy::spawn` restores the user's console.
 pub struct ConsoleMode {
-    stdin_handle: HANDLE,
-    original_mode: u32,
-    stdout_handle: HANDLE,
-    original_out_mode: Option<u32>,
+    stdin: Option<(HANDLE, u32)>,
+    stdout: Option<(HANDLE, u32)>,
 }
 
 impl Drop for ConsoleMode {
     fn drop(&mut self) {
-        // SAFETY: both handles came from GetStdHandle in setup_raw_mode, and
-        // the modes are the ones read there before any change.
-        unsafe { SetConsoleMode(self.stdin_handle, self.original_mode) };
-        if let Some(out_mode) = self.original_out_mode {
-            // SAFETY: as above.
-            unsafe { SetConsoleMode(self.stdout_handle, out_mode) };
+        for (handle, mode) in [self.stdin, self.stdout].into_iter().flatten() {
+            // SAFETY: each handle came from GetStdHandle in setup_raw_mode, and
+            // its mode is the one read there before any change.
+            unsafe { SetConsoleMode(handle, mode) };
         }
     }
 }
@@ -89,48 +85,45 @@ pub struct TerminalSize {
     pub ws_col: u16,
 }
 
-/// Put stdin into raw mode and return the saved console mode.
-/// Returns `None` if stdin is not a console.
-pub fn setup_raw_mode() -> Result<Option<ConsoleMode>> {
+/// Put stdin into raw mode and stdout into VT processing, each only if it is
+/// a console; a redirected one is left alone. Returns the saved modes.
+pub fn setup_raw_mode() -> Result<ConsoleMode> {
+    let mut saved = ConsoleMode {
+        stdin: None,
+        stdout: None,
+    };
+
     // SAFETY: GetStdHandle returns a pseudo-handle for stdin.
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let mut mode: u32 = 0;
     // SAFETY: handle is a valid console handle, mode is a valid u32 pointer.
-    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        return Ok(None); // Not a console
+    if unsafe { GetConsoleMode(handle, &mut mode) } != 0 {
+        // Disable line input, echo, and processed input (raw mode); enable
+        // virtual terminal input for escape sequences.
+        let raw = (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_WINDOW_INPUT;
+        // SAFETY: handle is a valid console handle.
+        if unsafe { SetConsoleMode(handle, raw) } == 0 {
+            anyhow::bail!("SetConsoleMode failed: {}", io::Error::last_os_error());
+        }
+        saved.stdin = Some((handle, mode));
     }
 
-    let original_mode = mode;
-
-    // Disable line input, echo, and processed input (raw mode)
-    mode &= !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-    // Enable virtual terminal input for escape sequences
-    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT;
-
-    // SAFETY: handle is a valid console handle, mode has been modified above.
-    if unsafe { SetConsoleMode(handle, mode) } == 0 {
-        anyhow::bail!("SetConsoleMode failed: {}", io::Error::last_os_error());
-    }
-
-    // Also enable VT processing on stdout
     // SAFETY: GetStdHandle returns a pseudo-handle for stdout.
     let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let mut out_mode: u32 = 0;
-    let mut original_out_mode = None;
     // SAFETY: stdout_handle and out_mode are valid pointers for GetConsoleMode.
     if unsafe { GetConsoleMode(stdout_handle, &mut out_mode) } != 0 {
-        original_out_mode = Some(out_mode);
-        out_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        // SAFETY: stdout_handle is valid, out_mode has VT processing flag set.
-        unsafe { SetConsoleMode(stdout_handle, out_mode) };
+        // SAFETY: stdout_handle is a valid console handle.
+        if unsafe { SetConsoleMode(stdout_handle, out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) }
+            != 0
+        {
+            saved.stdout = Some((stdout_handle, out_mode));
+        }
     }
 
-    Ok(Some(ConsoleMode {
-        stdin_handle: handle,
-        original_mode,
-        stdout_handle,
-        original_out_mode,
-    }))
+    Ok(saved)
 }
 
 /// Install Ctrl+C / Ctrl+Break handler.
