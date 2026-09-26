@@ -148,7 +148,8 @@ distinct attack surface from Unix:
 
 | Area | Threat | Mitigation | Status |
 |------|--------|------------|--------|
-| ConPTY pipe I/O | ReadFile/WriteFile on anonymous pipes could block indefinitely | Reader thread isolates blocking reads; main loop uses non-blocking polling via `GetNumberOfConsoleInputEvents` | Mitigated |
+| ConPTY pipe I/O | ReadFile/WriteFile on anonymous pipes or the console could block indefinitely | The output pipe and stdin are each read on their own thread; the event loop only polls channels | Mitigated |
+| Output flood | Child writes faster than the terminal drains | Output reaches the event loop through a bounded channel (16 x 64 KiB); a full channel back-pressures the child's pipe | Mitigated |
 | Command-line injection | `CreateProcessW` command line could be manipulated via embedded quotes/backslashes | `quote_arg_windows()` implements `CommandLineToArgvW`-compatible quoting with 11 unit tests | Mitigated |
 | Console handle lifetime | Raw HANDLE values (`HPCON`, process/thread handles, pipe handles) must be properly closed | `Drop` impl closes all handles; `conpty` set to 0 after early close to prevent double-free | Mitigated |
 | Polling loop CPU usage | `Sleep(5)` busy-wait loop consumes more CPU than `poll(2)` on Unix | Acceptable for a user-interactive tool; 5ms sleep limits CPU to ~1-2% | Accepted risk |

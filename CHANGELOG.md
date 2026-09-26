@@ -34,6 +34,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Sync buffer overflow: hard cap at 1 MiB prevents unbounded memory growth from
   malicious child processes that never send `SYNC_END`
+- Unix: stdin EOF stopped the proxy before the child's output was relayed; stdin
+  EOF or hangup now stops input only
+- Unix: a failed spawn after raw mode (e.g. a missing command) left the terminal
+  raw; the termios guard is back
+- Windows: a resize or focus event could stall the event loop until a key was
+  pressed; stdin is read on its own thread
+- Windows: redirected stdin (pipe, file) was never forwarded to the child
+- Windows: with redirected stdio the child inherited it and bypassed ConPTY; it
+  now gets invalid std handles and attaches to the pseudo-console
+- Windows: unbounded output queue between the pipe reader and the event loop;
+  it is bounded, so a fast child is back-pressured
+- Windows: a failed spawn left the console raw, and stdout's mode was never
+  restored; both modes are restored on every exit path
+- Windows: a `CTRL_C_EVENT` sent to the proxy is forwarded to the child as 0x03
+- Leaving lookback or the alternate screen with no new child output left the
+  history dump on screen; the live screen is rendered immediately
+- History could store half of an escape sequence split across reads (0.1.5's
+  verbatim fast path); every chunk is re-encoded, as before 0.1.5
+- Nix build: a debug-assertion test is skipped under the release test profile
 
 ### Security
 - anyhow 1.0.104 (RUSTSEC-2026-0190, unsound `Error::downcast_mut`)
@@ -42,8 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Logging refactored: stderr logging available in release builds; file-write remains debug-only
 - CONTRIBUTING.md updated with CI checks, debug logging instructions, and security guidance
-- SECURITY.md cross-references THREAT_MODEL.md
+- SECURITY.md cross-references THREAT_MODEL.md and points at primeinc/claude-chill
 - README documents verbose flag, Windows config path, and troubleshooting
+- `rust-version` 1.88: the crate uses let chains
 
 ## [0.1.5] - 2026-03-26
 
