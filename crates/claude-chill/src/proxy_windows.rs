@@ -16,8 +16,8 @@ use crate::proxy_common::should_auto_lookback;
 use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::SyncBlockParser;
 use crate::terminal_windows::{
-    self, ConsoleMode, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, TerminalSize, get_terminal_size,
-    setup_raw_mode, setup_signal_handlers,
+    ConsoleMode, SIGINT_RECEIVED, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, TerminalSize,
+    get_terminal_size, setup_raw_mode, setup_signal_handlers,
 };
 use crate::vt_renderer::VtRenderer;
 use anyhow::{Context, Result};
@@ -50,7 +50,8 @@ pub struct Proxy {
     child_thread: HANDLE,
     pipe_input_write: HANDLE, // Write end: our input → child's stdin
     pipe_output_read: HANDLE, // Read end: child's stdout → our output
-    original_console_mode: Option<ConsoleMode>,
+    // Held for its Drop, which restores the console modes.
+    _console_mode: Option<ConsoleMode>,
 
     // VT rendering
     renderer: VtRenderer,
@@ -189,7 +190,7 @@ impl Proxy {
             child_thread,
             pipe_input_write,
             pipe_output_read,
-            original_console_mode,
+            _console_mode: original_console_mode,
             renderer,
             last_stdin_time: None,
             last_auto_lookback_time: None,
@@ -223,7 +224,9 @@ impl Proxy {
         // Convert HANDLE to usize for thread transfer (HANDLE is *mut c_void,
         // which isn't Send). usize round-trips safely on Windows.
         let pipe_handle_raw = self.pipe_output_read as usize;
-        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Bounded, at most 16 x 64 KiB queued: a child that outpaces the
+        // terminal blocks on its full pipe instead of growing this process.
+        let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
         let reader_thread = std::thread::spawn(move || {
             let pipe_output_read = pipe_handle_raw as HANDLE;
             let mut read_buf = vec![0u8; 65536];
@@ -299,6 +302,13 @@ impl Proxy {
                     windows_sys::Win32::System::Threading::TerminateProcess(self.child_process, 1);
                 }
             }
+            // Keyboard Ctrl+C reaches the child as byte 0x03 (raw mode clears
+            // ENABLE_PROCESSED_INPUT). A CTRL_C_EVENT sent to this process by
+            // other means is forwarded the same way; ConPTY turns 0x03 into
+            // the child's Ctrl+C.
+            if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
+                self.write_to_pty(b"\x03")?;
+            }
 
             // Poll for resize (Windows doesn't have SIGWINCH)
             self.check_resize()?;
@@ -314,9 +324,11 @@ impl Proxy {
                 stdout.flush()?;
             }
 
-            // Drain all available output from the reader thread (non-blocking)
+            // Drain output from the reader thread (non-blocking), at most one
+            // channel's worth per pass so a busy child cannot starve stdin and
+            // resize handling.
             let mut got_output = false;
-            while let Ok(data) = output_rx.try_recv() {
+            for data in output_rx.try_iter().take(16) {
                 self.process_output(&data, &mut stdout)?;
                 got_output = true;
             }
@@ -350,23 +362,22 @@ impl Proxy {
             }
         }
 
-        // Close the ConPTY BEFORE joining the reader thread.
+        // Close the ConPTY on a helper thread while this thread keeps draining.
         // Per MS docs: "closing the pseudoconsole session may emit a final frame
         // update to hOutput which should be drained from the communications channel
-        // buffer." The reader thread does this draining. ClosePseudoConsole will
-        // break the pipe, causing the reader thread's ReadFile to return 0/error.
-        // SAFETY: conpty is a valid HPCON from CreatePseudoConsole. Set to 0 after
-        // to prevent double-close in Drop.
-        unsafe { ClosePseudoConsole(self.conpty) };
+        // buffer." The reader thread forwards that frame, and with a bounded
+        // channel it can only do so while this thread receives. The close breaks
+        // the pipe, the reader exits and drops its sender, and recv() ends.
+        let conpty = self.conpty;
         self.conpty = 0; // Mark as closed so Drop doesn't double-close
-
-        // Now the reader thread can finish (pipe is broken)
-        let _ = reader_thread.join();
-
-        // Drain any final output the reader thread sent before exiting
-        while let Ok(data) = output_rx.try_recv() {
+        // SAFETY: conpty is a valid HPCON from CreatePseudoConsole, closed once
+        // here; Drop skips it because self.conpty is now 0.
+        let closer = std::thread::spawn(move || unsafe { ClosePseudoConsole(conpty) });
+        while let Ok(data) = output_rx.recv() {
             self.process_output(&data, &mut stdout)?;
         }
+        let _ = reader_thread.join();
+        let _ = closer.join();
 
         // Final render
         if self.renderer.is_pending()
@@ -693,9 +704,7 @@ impl Drop for Proxy {
             CloseHandle(self.child_process);
             CloseHandle(self.child_thread);
         }
-        if let Some(ref mode) = self.original_console_mode {
-            terminal_windows::restore_console_mode(mode);
-        }
+        // _console_mode restores the console in its own Drop.
     }
 }
 

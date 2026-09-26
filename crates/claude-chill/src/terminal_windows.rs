@@ -19,10 +19,26 @@ pub static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 /// Set by the Ctrl handler when Ctrl+Break is pressed.
 pub static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-/// Saved console mode for stdin, restored on drop.
+/// Console modes saved by `setup_raw_mode`, restored on drop: stdin's, and
+/// stdout's when it is a console (VT processing is turned on there). Dropping
+/// it on any early return from `Proxy::spawn` restores the user's console.
 pub struct ConsoleMode {
     stdin_handle: HANDLE,
     original_mode: u32,
+    stdout_handle: HANDLE,
+    original_out_mode: Option<u32>,
+}
+
+impl Drop for ConsoleMode {
+    fn drop(&mut self) {
+        // SAFETY: both handles came from GetStdHandle in setup_raw_mode, and
+        // the modes are the ones read there before any change.
+        unsafe { SetConsoleMode(self.stdin_handle, self.original_mode) };
+        if let Some(out_mode) = self.original_out_mode {
+            // SAFETY: as above.
+            unsafe { SetConsoleMode(self.stdout_handle, out_mode) };
+        }
+    }
 }
 
 /// Console Ctrl handler callback.
@@ -100,8 +116,10 @@ pub fn setup_raw_mode() -> Result<Option<ConsoleMode>> {
     // SAFETY: GetStdHandle returns a pseudo-handle for stdout.
     let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let mut out_mode: u32 = 0;
+    let mut original_out_mode = None;
     // SAFETY: stdout_handle and out_mode are valid pointers for GetConsoleMode.
     if unsafe { GetConsoleMode(stdout_handle, &mut out_mode) } != 0 {
+        original_out_mode = Some(out_mode);
         out_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         // SAFETY: stdout_handle is valid, out_mode has VT processing flag set.
         unsafe { SetConsoleMode(stdout_handle, out_mode) };
@@ -110,6 +128,8 @@ pub fn setup_raw_mode() -> Result<Option<ConsoleMode>> {
     Ok(Some(ConsoleMode {
         stdin_handle: handle,
         original_mode,
+        stdout_handle,
+        original_out_mode,
     }))
 }
 
@@ -154,11 +174,4 @@ pub fn read_stdin(buf: &mut [u8]) -> Result<usize, io::Error> {
 /// Convert an `ExitStatus` to an integer exit code.
 pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(1)
-}
-
-/// Restore terminal settings. Called from `Proxy::drop`.
-pub fn restore_console_mode(mode: &ConsoleMode) {
-    // SAFETY: stdin_handle was obtained from GetStdHandle during setup_raw_mode
-    // and original_mode is the mode that was saved before modification.
-    unsafe { SetConsoleMode(mode.stdin_handle, mode.original_mode) };
 }
