@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deny.toml` — cargo-deny configuration for license and supply chain checks
 - `cargo-deny` CI job for automated license compliance
 - CHANGELOG version check in CI (must match Cargo.toml)
+- criterion benchmarks: `render` (VtRenderer full and diff) and `filter`
+  (HistoryFilter, SyncBlockParser)
+- cargo-fuzz targets: `fuzz_sync_block`, `fuzz_history_filter`, `fuzz_key_parser`
 - 5 new e2e tests: verbose flag, special characters, nonzero exit codes, help, version
 - 2 new config tests: verbose default and TOML parsing
 - Windows config path documented in README
@@ -31,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Sync buffer overflow: hard cap at 1 MiB prevents unbounded memory growth from
   malicious child processes that never send `SYNC_END`
-- Pre-existing benchmark compilation error in `render.rs` (return of borrowed reference)
-- Pre-existing clippy warning in `render.rs` (useless `format!`)
+
+### Security
+- anyhow 1.0.104 (RUSTSEC-2026-0190, unsound `Error::downcast_mut`)
+- crossbeam-epoch 0.9.21 (RUSTSEC-2026-0204, via the criterion dev-dependency)
 
 ### Changed
 - Logging refactored: stderr logging available in release builds; file-write remains debug-only
@@ -40,84 +45,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SECURITY.md cross-references THREAT_MODEL.md
 - README documents verbose flag, Windows config path, and troubleshooting
 
-## [0.1.5] - 2025-06-01
-
-### Fixed
-- Security hardening: whitelist-based escape sequence filter with explicit
-  classification of every `termwiz::Action` variant (no catch-all fallbacks)
-- Deduplication of lookback sequence handling between legacy and Kitty protocol
-
-### Changed
-- Improved input validation: lookback sequences validated at spawn time with
-  16-byte length cap
-
-## [0.1.4] - 2025-05-01
+## [0.1.5] - 2026-03-26
 
 ### Added
-- Windows support via ConPTY pseudo-console
-- Cross-platform E2E tests proving Windows proxy works
-- Threaded pipe reader for Windows event loop
+- Windows support via ConPTY, with a threaded pipe reader for the event loop
+- Windows in the CI check, clippy, and test matrix
+- Cross-platform E2E tests that run the proxy on Windows
+- `cargo-audit` CI job
+- `SECURITY.md` with trust boundaries and disclosure process
+- Nix package (#29)
+- `cargo install --git` installation instructions (#31)
+- Module docs on all source files and doc comments on all public items
+- `#[must_use]` on pure public functions
+- Tests for SyncBlockParser, KittyTracker, AltScreenTracker, sequence_match,
+  config, key_parser, HistoryFilter, VtRenderer, HistoryManager, and proxy flow
 
 ### Changed
-- CI matrix expanded to include Windows for check, clippy, and test jobs
+- `proxy.rs` split into platform-independent modules: SequenceMatcher,
+  terminal utilities, `kitty_tracker.rs`, HistoryManager, VtRenderer, and
+  `proxy_common.rs` (ProxyConfig, `should_auto_lookback`)
+- Dead `escape_filter` removed
+- Lookback sequences validated at spawn time, 16-byte cap
+- `CLAUDE_CHILL_LOG_FILE` only in debug builds
 
-## [0.1.3] - 2025-04-01
-
-### Changed
-- Extracted `VtRenderer` and `HistoryManager` from monolithic `Proxy`
-- Extracted `SequenceMatcher`, `AltScreenTracker`, and platform-independent
-  modules from `proxy.rs`
-- Extracted terminal utilities into dedicated `terminal.rs`
-
-### Added
-- `#[must_use]` annotations on pure public functions
-- Debug assertions and input validation
-- Comprehensive integration tests for `VtRenderer` and `HistoryManager`
-- Stress and edge-case tests for `HistoryManager`, `SyncBlockParser`
-- Fuzz targets for `sync_block`, `history_filter`, `key_parser`
-- Module documentation on all source files
-- Doc comments on all public items
+### Removed
+- `CLAUDE_CHILL_HISTORY_FILE`, which wrote terminal history to a caller-chosen path
 
 ### Fixed
+- Windows command injection: arguments quoted with `CommandLineToArgvW`-compatible
+  escaping (`quote_arg_windows`)
+- Exit code truncation: `std::process::exit` instead of a `u8` cast
+- Backward compatibility for the removed `refresh_rate` config field
 - Sync block handling before alt screen enter
-- Backward compatibility for removed `refresh_rate` config field
-- Panic in `sequence_match::check` with empty sequence
-- Ghostty terminal support
+- Panic in `sequence_match::check` with an empty sequence
+- `rerun-if-changed` paths in `build.rs` for the workspace layout
+- `render_vt_screen` writes through `write_to_terminal`
 
 ### Performance
-- Fast-path `HistoryFilter` returning `Cow::Borrowed` when all actions are safe
-- Pre-allocated segment Vec in `process_output` hot path
-- Removed unnecessary 1 MiB re-allocation after sync block flush
-- Pre-allocated `history_filter` output buffer with input capacity
+- No 1 MiB re-allocation after a sync block flush
+- HistoryFilter returns `Cow::Borrowed` when every action is safe, and
+  pre-allocates its output buffer
+- Pre-allocated segment Vec in the `process_output` hot path
 
-## [0.1.2] - 2025-03-01
-
-### Fixed
-- Filtered Kitty keyboard and other terminal queries from history
-- Removed terminal queries from history to prevent terminal responses on stdin
-- Fixed Kitty keyboard protocol detection and tracking
-- Fixed auto-lookback trigger timing
-
-### Added
-- Auto-lookback mode with configurable idle timeout (`-a` flag)
-- Version tracking in CLI output via build script
-
-## [0.1.1] - 2025-02-01
-
-### Added
-- VT100 emulator-based differential rendering
-- Nix package support (`flake.nix`)
+## [0.1.4] - 2026-01-25
 
 ### Fixed
-- Exit display cleanup on process termination
-- macOS compatibility (Ctrl+Shift+6 for lookback key)
+- Ghostty terminal support (#26)
 
-## [0.1.0] - 2025-01-01
+## [0.1.3] - 2026-01-24
+
+### Fixed
+- Kitty keyboard and other terminal queries filtered from history (#23)
+
+### Changed
+- README: Ctrl+Shift+6 for lookback on macOS
+
+## [0.1.2] - 2026-01-22
+
+### Fixed
+- Kitty keyboard protocol handling (#21)
+
+## [0.1.1] - 2026-01-22
 
 ### Added
-- Initial release
-- PTY proxy with synchronized output block interception (DEC mode 2026)
-- Scrollback history buffer with configurable max lines
-- Configurable lookback key via CLI (`-k`) and config file
-- TOML configuration file support (`~/.config/claude-chill.toml`)
-- CI workflow with format, lint, and test checks
+- CLI, TOML config file (`~/.config/claude-chill.toml`), and configurable lookback key
+- CI workflow (#1)
+- macOS support (#3)
+- VT100 emulator-based rendering (#6)
+- Auto-lookback mode (#7) and its `-a` short flag (#8)
+- Version and git commit in `--version` (#20)
+
+### Fixed
+- Key sequences (#2)
+- Exit display cleanup (#4)
+- Terminal queries removed from history so the terminal does not answer them on stdin (#10)
+- Auto-lookback trigger (#20)
+
+## [0.1.0] - 2026-01-16
+
+### Added
+- Initial release: PTY proxy that truncates synchronized output blocks
+  (`?2026h` … `?2026l`) to `CHILL_MAX_LINES` and keeps the full output in a
+  history buffer, dumped by `Ctrl+Shift+PgUp` (lookback)
