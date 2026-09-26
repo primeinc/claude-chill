@@ -33,9 +33,10 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 /// Query the terminal dimensions via ioctl. Falls back to 24x80 on failure.
 pub fn get_terminal_size() -> Result<Winsize> {
     // SAFETY: Winsize is a plain C struct with no padding requirements;
-    // zeroed memory is a valid initial state. TIOCGWINSZ writes the
-    // terminal dimensions into ws; stdout is a valid fd.
+    // zeroed memory is a valid initial state.
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes the terminal dimensions into ws, a valid
+    // Winsize that outlives the call; stdout is a valid fd.
     let ret = unsafe {
         libc::ioctl(
             io::stdout().as_raw_fd(),

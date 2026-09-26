@@ -262,7 +262,9 @@ mod tests {
         assert_eq!(tracker.find_exit(&data), Some(pos));
     }
 
+    // debug_assert! is compiled out under release, which Nix's buildRustPackage tests.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "enter_len called on data not starting with")]
     fn test_enter_len_panics_for_unknown_in_debug() {
         let tracker = AltScreenTracker::new();

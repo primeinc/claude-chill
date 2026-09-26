@@ -172,6 +172,9 @@ impl Proxy {
         let stdout_fd = io::stdout();
 
         let mut buf = [0u8; 65536];
+        // Cleared at stdin EOF or hangup. The child keeps running and its
+        // output is relayed until the PTY closes, as on Windows.
+        let mut stdin_open = true;
 
         loop {
             if SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
@@ -185,15 +188,17 @@ impl Proxy {
             }
 
             // SAFETY: pty_master is an OwnedFd that outlives the poll call.
-            // stdin_fd is io::stdin() which lives for the duration of the loop.
-            // The BorrowedFd references are only used within this loop iteration.
+            // The BorrowedFd is only used within this loop iteration.
             let master_fd = unsafe { BorrowedFd::borrow_raw(self.pty_master.as_raw_fd()) };
+            // SAFETY: stdin_fd is io::stdin(), which lives for the duration of
+            // the loop. The BorrowedFd is only used within this loop iteration.
             let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
 
             let mut poll_fds = [
                 PollFd::new(master_fd, PollFlags::POLLIN),
                 PollFd::new(stdin_borrowed, PollFlags::POLLIN),
             ];
+            let polled = if stdin_open { 2 } else { 1 };
 
             let poll_timeout_ms = self
                 .renderer
@@ -205,7 +210,7 @@ impl Proxy {
                 .map(|d| d.as_millis().min(100) as u16)
                 .unwrap_or(100);
 
-            match poll(&mut poll_fds, PollTimeout::from(poll_timeout_ms)) {
+            match poll(&mut poll_fds[..polled], PollTimeout::from(poll_timeout_ms)) {
                 Ok(0) => {
                     self.flush_pending_vt_render(&stdout_fd)?;
                     self.check_auto_lookback(&stdout_fd)?;
@@ -233,14 +238,21 @@ impl Proxy {
                 }
             }
 
-            if let Some(revents) = poll_fds[1].revents()
-                && revents.contains(PollFlags::POLLIN)
-            {
-                match nix_read(&stdin_fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => self.process_input(&buf[..n], &stdout_fd)?,
-                    Err(Errno::EAGAIN) => {}
-                    Err(e) => anyhow::bail!("read from stdin failed: {e}"),
+            if stdin_open && let Some(revents) = poll_fds[1].revents() {
+                if revents.contains(PollFlags::POLLIN) {
+                    match nix_read(&stdin_fd, &mut buf) {
+                        Ok(0) => stdin_open = false,
+                        Ok(n) => self.process_input(&buf[..n], &stdout_fd)?,
+                        Err(Errno::EAGAIN) => {}
+                        Err(e) => anyhow::bail!("read from stdin failed: {e}"),
+                    }
+                } else if revents
+                    .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+                {
+                    stdin_open = false;
+                }
+                if !stdin_open {
+                    debug!("stdin closed; relaying child output until the PTY closes");
                 }
             }
         }
