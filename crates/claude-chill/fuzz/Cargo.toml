@@ -1,0 +1,33 @@
+[package]
+name = "claude-chill-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.claude-chill]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_sync_block"
+path = "fuzz_targets/fuzz_sync_block.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_history_filter"
+path = "fuzz_targets/fuzz_history_filter.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_key_parser"
+path = "fuzz_targets/fuzz_key_parser.rs"
+doc = false

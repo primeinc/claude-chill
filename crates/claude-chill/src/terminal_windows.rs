@@ -26,6 +26,10 @@ pub struct ConsoleMode {
 }
 
 /// Console Ctrl handler callback.
+///
+/// # Safety
+/// Called by the Windows console subsystem. Only performs atomic stores,
+/// which are safe from any thread context.
 unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
     match ctrl_type {
         CTRL_C_EVENT => {
@@ -42,8 +46,11 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 
 /// Query the terminal dimensions. Falls back to 24x80 on failure.
 pub fn get_terminal_size() -> Result<TerminalSize> {
+    // SAFETY: GetStdHandle returns a pseudo-handle for stdout; no cleanup needed.
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    // SAFETY: CONSOLE_SCREEN_BUFFER_INFO is a plain C struct; zeroed is valid.
     let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: handle is a valid stdout handle, info is a properly-sized buffer.
     let ret = unsafe { GetConsoleScreenBufferInfo(handle, &mut info) };
     if ret == 0 {
         return Ok(TerminalSize {
@@ -69,8 +76,10 @@ pub struct TerminalSize {
 /// Put stdin into raw mode and return the saved console mode.
 /// Returns `None` if stdin is not a console.
 pub fn setup_raw_mode() -> Result<Option<ConsoleMode>> {
+    // SAFETY: GetStdHandle returns a pseudo-handle for stdin.
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let mut mode: u32 = 0;
+    // SAFETY: handle is a valid console handle, mode is a valid u32 pointer.
     if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
         return Ok(None); // Not a console
     }
@@ -82,15 +91,19 @@ pub fn setup_raw_mode() -> Result<Option<ConsoleMode>> {
     // Enable virtual terminal input for escape sequences
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT;
 
+    // SAFETY: handle is a valid console handle, mode has been modified above.
     if unsafe { SetConsoleMode(handle, mode) } == 0 {
         anyhow::bail!("SetConsoleMode failed: {}", io::Error::last_os_error());
     }
 
     // Also enable VT processing on stdout
+    // SAFETY: GetStdHandle returns a pseudo-handle for stdout.
     let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let mut out_mode: u32 = 0;
+    // SAFETY: stdout_handle and out_mode are valid pointers for GetConsoleMode.
     if unsafe { GetConsoleMode(stdout_handle, &mut out_mode) } != 0 {
         out_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        // SAFETY: stdout_handle is valid, out_mode has VT processing flag set.
         unsafe { SetConsoleMode(stdout_handle, out_mode) };
     }
 
@@ -102,6 +115,8 @@ pub fn setup_raw_mode() -> Result<Option<ConsoleMode>> {
 
 /// Install Ctrl+C / Ctrl+Break handler.
 pub fn setup_signal_handlers() -> Result<()> {
+    // SAFETY: ctrl_handler is a valid extern "system" callback that only
+    // performs atomic stores, which are safe from any thread context.
     if unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), TRUE) } == 0 {
         anyhow::bail!(
             "SetConsoleCtrlHandler failed: {}",
@@ -143,5 +158,7 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 
 /// Restore terminal settings. Called from `Proxy::drop`.
 pub fn restore_console_mode(mode: &ConsoleMode) {
+    // SAFETY: stdin_handle was obtained from GetStdHandle during setup_raw_mode
+    // and original_mode is the mode that was saved before modification.
     unsafe { SetConsoleMode(mode.stdin_handle, mode.original_mode) };
 }

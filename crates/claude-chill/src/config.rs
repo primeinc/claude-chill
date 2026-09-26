@@ -15,6 +15,7 @@ pub struct Config {
     pub history_lines: usize,
     pub lookback_key: String,
     pub auto_lookback_timeout_ms: u64,
+    pub verbose: bool,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
             auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
+            verbose: false,
         }
     }
 }
@@ -158,9 +160,26 @@ mod tests {
         let path = Config::config_path();
         assert!(path.is_some(), "config_path should return Some");
         let path = path.unwrap();
+        let path_str = path.to_string_lossy();
         assert!(
-            path.to_string_lossy().contains("claude-chill"),
-            "config path should contain 'claude-chill'"
+            path_str.contains("claude-chill"),
+            "config path should contain 'claude-chill', got: {path_str}"
+        );
+        // Platform-specific checks
+        #[cfg(windows)]
+        assert!(
+            path_str.contains("AppData") || path_str.contains("Roaming"),
+            "Windows config path should be in AppData, got: {path_str}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            path_str.contains("Application Support"),
+            "macOS config path should be in Application Support, got: {path_str}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            path_str.contains(".config"),
+            "Linux config path should be in .config, got: {path_str}"
         );
     }
 
@@ -175,5 +194,17 @@ mod tests {
     fn test_invalid_lookback_key_returns_error() {
         let config: Config = toml::from_str(r#"lookback_key = "invalid""#).unwrap();
         assert!(config.parse_lookback_key().is_err());
+    }
+
+    #[test]
+    fn test_verbose_default_false() {
+        let config = Config::default();
+        assert!(!config.verbose);
+    }
+
+    #[test]
+    fn test_verbose_from_toml() {
+        let config: Config = toml::from_str("verbose = true").unwrap();
+        assert!(config.verbose);
     }
 }

@@ -26,6 +26,14 @@ jobs:
             exit 1
           fi
           echo "Version badge matches: $CARGO_VERSION"
+      - name: Check CHANGELOG has entry for current version
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if ! grep -q "\[$CARGO_VERSION\]" CHANGELOG.md; then
+            echo "CHANGELOG.md missing entry for version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "CHANGELOG has entry for: $CARGO_VERSION"
 
   check:
     name: Check
@@ -83,7 +91,7 @@ jobs:
           fi
 
   integration:
-    name: Integration Tests
+    name: Integration Tests (expect)
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -110,6 +118,13 @@ jobs:
         run: cargo install cargo-audit
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit
+
+  deny:
+    name: Supply Chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   nix-build:
     name: Nix Build

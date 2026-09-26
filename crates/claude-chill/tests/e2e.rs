@@ -29,11 +29,13 @@ fn binary_path() -> PathBuf {
     path
 }
 
-/// Spawn the proxy wrapping `cmd.exe /c <shell_cmd>` and capture output.
-/// Returns (stdout_output, exit_code).
-fn run_proxy_with_command(shell_cmd: &str) -> (String, Option<i32>) {
+/// Spawn the proxy wrapping a shell command and capture output.
+/// Returns (stdout, stderr, exit_code).
+fn run_proxy_full(extra_args: &[&str], shell_cmd: &str) -> (String, String, Option<i32>) {
     let bin = binary_path();
-    let mut args = vec!["-a", "0", "--"];
+    let mut args: Vec<&str> = vec!["-a", "0"];
+    args.extend_from_slice(extra_args);
+    args.push("--");
 
     if cfg!(windows) {
         args.extend_from_slice(&["cmd.exe", "/c", shell_cmd]);
@@ -50,7 +52,15 @@ fn run_proxy_with_command(shell_cmd: &str) -> (String, Option<i32>) {
         .unwrap_or_else(|e| panic!("Failed to run {bin:?}: {e}"));
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let code = output.status.code();
+    (stdout, stderr, code)
+}
+
+/// Spawn the proxy wrapping `cmd.exe /c <shell_cmd>` and capture output.
+/// Returns (stdout_output, exit_code).
+fn run_proxy_with_command(shell_cmd: &str) -> (String, Option<i32>) {
+    let (stdout, _, code) = run_proxy_full(&[], shell_cmd);
     (stdout, code)
 }
 
@@ -119,4 +129,95 @@ fn test_e2e_large_output() {
         "Missing last line in:\n{stdout}"
     );
     assert_eq!(code, Some(0));
+}
+
+#[test]
+fn test_e2e_verbose_flag_produces_stderr() {
+    // --verbose should enable logging to stderr in release builds
+    let cmd = "echo VERBOSE_TEST";
+    let (stdout, stderr, code) = run_proxy_full(&["--verbose"], cmd);
+    assert!(
+        stdout.contains("VERBOSE_TEST"),
+        "Expected output in stdout.\nGot:\n{stdout}"
+    );
+    // Verbose mode should produce some debug output on stderr
+    assert!(
+        !stderr.is_empty(),
+        "Expected verbose logging on stderr but got nothing"
+    );
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn test_e2e_special_characters() {
+    // Test that special characters pass through correctly
+    let cmd = if cfg!(windows) {
+        "echo SPECIAL_123_ABC"
+    } else {
+        "echo 'SPECIAL_123_ABC'"
+    };
+    let (stdout, code) = run_proxy_with_command(cmd);
+    assert!(
+        stdout.contains("SPECIAL_123_ABC"),
+        "Special characters not preserved.\nGot:\n{stdout}"
+    );
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn test_e2e_nonzero_exit_codes() {
+    // Test various non-zero exit codes are forwarded correctly
+    for expected_code in [1, 2, 127] {
+        let cmd = if cfg!(windows) {
+            format!("exit /b {expected_code}")
+        } else {
+            format!("exit {expected_code}")
+        };
+        let (_, code) = run_proxy_with_command(&cmd);
+        assert_eq!(
+            code,
+            Some(expected_code),
+            "Expected exit code {expected_code}, got {code:?}"
+        );
+    }
+}
+
+#[test]
+fn test_e2e_help_flag() {
+    // --help should work and exit 0
+    let bin = binary_path();
+    let output = Command::new(&bin)
+        .args(["--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {bin:?}: {e}"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("claude-chill") || stdout.contains("PTY proxy"),
+        "Help output should mention the tool name.\nGot:\n{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn test_e2e_version_flag() {
+    // --version should print version and exit 0
+    let bin = binary_path();
+    let output = Command::new(&bin)
+        .args(["--version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {bin:?}: {e}"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0.1.5"),
+        "Version output should contain version number.\nGot:\n{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0));
 }

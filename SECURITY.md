@@ -13,6 +13,8 @@ Include:
 
 You should receive a response within 72 hours.
 
+For a formal STRIDE threat analysis, see [THREAT_MODEL.md](THREAT_MODEL.md).
+
 ## Trust Boundaries
 
 claude-chill operates as a PTY proxy between two trust domains:

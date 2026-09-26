@@ -63,6 +63,8 @@ Options:
           Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
   -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
           Auto-lookback timeout in ms, 0 to disable (default: 15000)
+  -v, --verbose
+          Enable verbose logging to stderr
   -h, --help
           Print help
   -V, --version
@@ -86,6 +88,12 @@ claude-chill -k "[f12]" claude
 
 # Disable auto-lookback (see below)
 claude-chill -a 0 claude
+
+# Enable debug logging to stderr
+claude-chill -v claude
+
+# Or use RUST_LOG for granular control
+RUST_LOG=claude_chill=debug claude-chill claude
 
 # Combine options with claude arguments
 claude-chill -H 50000 -a 0 -- claude --verbose
@@ -115,11 +123,13 @@ After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), t
 Config file location:
 - **Linux**: `~/.config/claude-chill.toml`
 - **macOS**: `~/Library/Application Support/claude-chill.toml`
+- **Windows**: `%APPDATA%\claude-chill.toml`
 
 ```toml
 history_lines = 100000           # Max lines stored for lookback
 lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
 auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
+verbose = false                  # Enable debug logging to stderr
 ```
 
 Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
@@ -191,11 +201,36 @@ inputs.claude-chill.packages.${system}.default
 
 ## Disclaimer
 
-This tool was developed for personal convenience. It works for me on Linux and macOS, but it hasn't been extensively tested across different terminals or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.
+This tool was developed for personal convenience. It works on Linux, macOS, and Windows, but it hasn't been extensively tested across all terminals or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.
+
+## Troubleshooting
+
+Enable debug logging to diagnose issues:
+
+```bash
+# Quick verbose mode
+claude-chill -v claude
+
+# Granular control via RUST_LOG
+RUST_LOG=claude_chill=debug claude-chill claude
+
+# Or set in config for persistent logging
+# Add `verbose = true` to your claude-chill.toml
+```
+
+Debug output goes to stderr, so it won't interfere with the terminal proxy.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting and trust boundary documentation.
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for a formal STRIDE threat analysis covering all trust boundaries.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+CI checks include format, clippy, tests (Linux/macOS/Windows), `cargo-audit` (vulnerability scanning), and `cargo-deny` (license compliance and supply chain verification).
 
 ## License
 

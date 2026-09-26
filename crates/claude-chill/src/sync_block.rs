@@ -88,6 +88,17 @@ impl SyncBlockParser {
                     pos += idx + SYNC_END.len();
                 } else {
                     self.sync_buffer.extend_from_slice(&data[pos..]);
+                    // Hard cap: if the sync buffer exceeds capacity without
+                    // finding the end marker, flush it as a completed block.
+                    // This prevents unbounded memory growth from a malicious
+                    // or buggy child process that never sends SYNC_END.
+                    if self.sync_buffer.len() > SYNC_BUFFER_CAPACITY {
+                        debug!(
+                            "SyncBlockParser: buffer exceeded {SYNC_BUFFER_CAPACITY} bytes, force-flushing"
+                        );
+                        segments.push(self.make_sync_segment());
+                        self.in_sync_block = false;
+                    }
                     break;
                 }
             } else if let Some(idx) = self.sync_start_finder.find(&data[pos..]) {
@@ -549,5 +560,42 @@ mod tests {
         parser.parse(&end_chunk, &mut segments);
         assert_eq!(segments.len(), 1);
         assert!(!parser.in_sync_block());
+    }
+
+    #[test]
+    fn test_buffer_overflow_force_flush() {
+        // When the sync buffer exceeds SYNC_BUFFER_CAPACITY without finding
+        // SYNC_END, it should be force-flushed as a sync block.
+        let mut parser = SyncBlockParser::new();
+        let mut segments = Vec::new();
+
+        // Start a sync block
+        parser.parse(SYNC_START, &mut segments);
+        assert!(parser.in_sync_block());
+        assert!(segments.is_empty());
+
+        // Feed data that exceeds the capacity without a SYNC_END
+        let chunk_size = 64 * 1024; // 64 KiB chunks
+        let chunks_needed = (SYNC_BUFFER_CAPACITY / chunk_size) + 2;
+        let chunk = vec![b'X'; chunk_size];
+
+        for _ in 0..chunks_needed {
+            parser.parse(&chunk, &mut segments);
+        }
+
+        // The buffer should have been force-flushed
+        assert!(
+            !parser.in_sync_block(),
+            "parser should exit sync mode after buffer overflow"
+        );
+        // Should have at least one SyncBlock segment from force-flush
+        let sync_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| matches!(s, OutputSegment::SyncBlock { .. }))
+            .collect();
+        assert!(
+            !sync_segments.is_empty(),
+            "should have at least one force-flushed sync block"
+        );
     }
 }

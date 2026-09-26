@@ -6,6 +6,9 @@
 //!
 //! Supports Unix (PTY, termios, POSIX signals) and Windows (ConPTY, Console API).
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod alt_screen;
 pub mod config;
 pub mod escape_sequences;

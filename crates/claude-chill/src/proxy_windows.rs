@@ -111,6 +111,9 @@ impl Proxy {
         let mut pipe_output_read: HANDLE = INVALID_HANDLE_VALUE;
         let mut pipe_output_write: HANDLE = INVALID_HANDLE_VALUE;
 
+        // SAFETY: CreatePipe writes valid handles into the out-pointers.
+        // Null security attrs and zero buffer size use system defaults.
+        // Handles are cleaned up via CloseHandle on error or in Drop.
         unsafe {
             if CreatePipe(
                 &mut pipe_input_read,
@@ -140,10 +143,13 @@ impl Proxy {
             Y: winsize.ws_row as i16,
         };
         let mut conpty: HPCON = 0;
+        // SAFETY: pipe_input_read and pipe_output_write are valid handles from
+        // CreatePipe above. conpty receives the pseudo-console handle.
         let hr = unsafe {
             CreatePseudoConsole(size, pipe_input_read, pipe_output_write, 0, &mut conpty)
         };
         if hr != S_OK {
+            // SAFETY: All four handles are valid from CreatePipe; closing on error path.
             unsafe {
                 CloseHandle(pipe_input_read);
                 CloseHandle(pipe_input_write);
@@ -161,6 +167,8 @@ impl Proxy {
 
         // Per MS docs: "Upon completion of the CreateProcess call, the handles given
         // during creation should be freed from this process."
+        // SAFETY: pipe_input_read and pipe_output_write are valid handles that
+        // have been given to ConPTY and are no longer needed by this process.
         unsafe {
             CloseHandle(pipe_input_read);
             CloseHandle(pipe_output_write);
@@ -221,6 +229,8 @@ impl Proxy {
             let mut read_buf = vec![0u8; 65536];
             loop {
                 let mut bytes_read: u32 = 0;
+                // SAFETY: pipe_output_read is a valid pipe handle transferred
+                // via usize; read_buf is a valid buffer; bytes_read receives count.
                 let ok = unsafe {
                     ReadFile(
                         pipe_output_read,
@@ -245,6 +255,7 @@ impl Proxy {
         loop {
             // Check for signals
             if SIGTERM_RECEIVED.swap(false, Ordering::SeqCst) {
+                // SAFETY: child_process is a valid process handle from CreateProcessW.
                 unsafe {
                     windows_sys::Win32::System::Threading::TerminateProcess(self.child_process, 1);
                 }
@@ -280,6 +291,7 @@ impl Proxy {
             }
 
             // Check if child has exited AND output pipe is drained
+            // SAFETY: child_process is a valid handle; timeout 0 = non-blocking poll.
             let child_wait = unsafe { WaitForSingleObject(self.child_process, 0) };
             if child_wait == WAIT_OBJECT_0 {
                 // Child exited. Drain any remaining output from the channel.
@@ -302,6 +314,8 @@ impl Proxy {
         // update to hOutput which should be drained from the communications channel
         // buffer." The reader thread does this draining. ClosePseudoConsole will
         // break the pipe, causing the reader thread's ReadFile to return 0/error.
+        // SAFETY: conpty is a valid HPCON from CreatePseudoConsole. Set to 0 after
+        // to prevent double-close in Drop.
         unsafe { ClosePseudoConsole(self.conpty) };
         self.conpty = 0; // Mark as closed so Drop doesn't double-close
 
@@ -329,11 +343,13 @@ impl Proxy {
         use windows_sys::Win32::System::Console::{
             GetNumberOfConsoleInputEvents, GetStdHandle, STD_INPUT_HANDLE,
         };
+        // SAFETY: GetStdHandle returns a pseudo-handle for stdin.
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         let mut num_events: u32 = 0;
 
         // GetNumberOfConsoleInputEvents is non-blocking and tells us if there's
         // input waiting. Only call ReadFile if there IS input, to avoid blocking.
+        // SAFETY: stdin_handle is valid, num_events is a valid out-pointer.
         if unsafe { GetNumberOfConsoleInputEvents(stdin_handle, &mut num_events) } == 0 {
             // Not a console handle (e.g., piped input) — skip
             return Ok(());
@@ -343,6 +359,9 @@ impl Proxy {
         }
 
         let mut bytes_read: u32 = 0;
+        // SAFETY: stdin_handle is valid, buf is a valid buffer with sufficient length,
+        // bytes_read receives the actual count. ReadFile is safe for console input
+        // when events are available (checked above).
         let ok = unsafe {
             ReadFile(
                 stdin_handle,
@@ -461,6 +480,8 @@ impl Proxy {
         let mut written: u32 = 0;
         let mut offset = 0;
         while offset < data.len() {
+            // SAFETY: pipe_input_write is a valid write handle from CreatePipe,
+            // data slice is valid for the given length, written receives byte count.
             let ok = unsafe {
                 WriteFile(
                     self.pipe_input_write,
@@ -599,6 +620,7 @@ impl Proxy {
                     X: winsize.ws_col as i16,
                     Y: winsize.ws_row as i16,
                 };
+                // SAFETY: conpty is a valid HPCON, size is a valid COORD.
                 let hr = unsafe { ResizePseudoConsole(self.conpty, size) };
                 if hr != S_OK {
                     debug!("ResizePseudoConsole failed: HRESULT 0x{hr:08x}");
@@ -643,8 +665,11 @@ impl Proxy {
     }
 
     fn wait_child(&mut self) -> Result<i32> {
+        // SAFETY: child_process is a valid handle. 0xFFFFFFFF = INFINITE timeout.
         unsafe { WaitForSingleObject(self.child_process, 0xFFFFFFFF) }; // INFINITE
         let mut exit_code: u32 = 1;
+        // SAFETY: child_process has terminated (WaitForSingleObject returned),
+        // exit_code is a valid out-pointer.
         unsafe {
             windows_sys::Win32::System::Threading::GetExitCodeProcess(
                 self.child_process,
@@ -657,6 +682,9 @@ impl Proxy {
 
 impl Drop for Proxy {
     fn drop(&mut self) {
+        // SAFETY: All handles were obtained from Win32 API calls during spawn().
+        // conpty may have been set to 0 in run() to prevent double-close.
+        // CloseHandle is idempotent-safe for valid handles.
         unsafe {
             // conpty may have been closed already in run() — check for null
             if self.conpty != 0 {
@@ -778,6 +806,7 @@ fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(
         )
     } == 0
     {
+        // SAFETY: attr_list was initialized above; cleaning up on error path.
         unsafe { DeleteProcThreadAttributeList(attr_list) };
         anyhow::bail!(
             "UpdateProcThreadAttribute failed: {}",
@@ -790,6 +819,7 @@ fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(
     startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     startup_info.lpAttributeList = attr_list;
 
+    // SAFETY: PROCESS_INFORMATION is a plain C struct; zeroed is valid.
     let mut proc_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     // SAFETY: startup_info and proc_info are properly initialized. cmd_wide is a
@@ -810,10 +840,12 @@ fn create_child_process(conpty: HPCON, command: &str, args: &[&str]) -> Result<(
         )
     } == 0
     {
+        // SAFETY: attr_list was initialized; cleaning up on error path.
         unsafe { DeleteProcThreadAttributeList(attr_list) };
         anyhow::bail!("CreateProcessW failed: {}", io::Error::last_os_error());
     }
 
+    // SAFETY: attr_list is no longer needed after CreateProcessW succeeds.
     unsafe { DeleteProcThreadAttributeList(attr_list) };
 
     Ok((proc_info.hProcess, proc_info.hThread))
