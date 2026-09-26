@@ -7,7 +7,6 @@
 //! IMPORTANT: Every enum variant must be explicitly classified.
 //! No catch-all fallbacks - we must consciously decide on each case.
 
-use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 use termwiz::escape::Action;
 use termwiz::escape::csi::CSI;
@@ -34,29 +33,19 @@ impl HistoryFilter {
 
     /// Filter bytes, returning only safe sequences for history.
     ///
-    /// If all parsed actions are safe (common case), returns a borrowed reference
-    /// to the input bytes directly, avoiding allocation and preserving byte-level
-    /// fidelity.
+    /// Always re-encodes the parsed actions. The parser holds back an escape
+    /// sequence split across calls until it completes, so passing input bytes
+    /// through verbatim would store the sequence's first half while its
+    /// completing half is classified (and possibly dropped) on the next call.
     #[must_use]
-    pub fn filter<'a>(&mut self, input: &'a [u8]) -> Cow<'a, [u8]> {
-        let actions = self.parser.parse_as_vec(input);
-
-        // Fast path: if everything is safe, return input bytes directly.
-        // This avoids the Display re-encoding which can alter byte-level output
-        // (e.g. combined SGR params, elided default cursor params) and skips
-        // the Vec allocation entirely.
-        if actions.iter().all(is_safe_for_history) {
-            return Cow::Borrowed(input);
-        }
-
-        // Slow path: some actions are blacklisted, re-encode only the safe ones.
+    pub fn filter(&mut self, input: &[u8]) -> Vec<u8> {
         let mut output = String::with_capacity(input.len());
-        for action in actions {
+        for action in self.parser.parse_as_vec(input) {
             if is_safe_for_history(&action) {
                 let _ = write!(output, "{action}");
             }
         }
-        Cow::Owned(output.into_bytes())
+        output.into_bytes()
     }
 }
 
@@ -500,7 +489,7 @@ mod tests {
     fn test_plain_text_passes() {
         let mut filter = HistoryFilter::new();
         let output = filter.filter(b"Hello, World!");
-        assert_eq!(output.as_ref(), b"Hello, World!");
+        assert_eq!(output.as_slice(), b"Hello, World!");
     }
 
     #[test]
@@ -639,8 +628,11 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_cursor_home() {
-        assert_roundtrip_exact(b"\x1b[H", "cursor home");
+    fn test_reencoding_cursor_home() {
+        // termwiz re-encodes CUP with default params as \x1b[1;1H.
+        let mut filter = HistoryFilter::new();
+        assert_eq!(filter.filter(b"\x1b[H"), b"\x1b[1;1H".to_vec());
+        assert_roundtrip_visual(b"line one\r\nline two\x1b[HX", "cursor home then write");
     }
 
     #[test]
@@ -789,82 +781,28 @@ mod tests {
     }
 
     // ====================================================================
-    // Fast-path tests: verify that all-safe input is returned byte-exactly
+    // Re-encoding and chunk-boundary tests
     // ====================================================================
 
     #[test]
-    fn test_fast_path_plain_text() {
+    fn test_plain_text_round_trips() {
         let mut filter = HistoryFilter::new();
         let input = b"Hello, World!";
         let output = filter.filter(input);
-        assert_eq!(
-            output.as_ref(),
-            input,
-            "fast path: plain text should return exact bytes"
-        );
+        assert_eq!(output, input.to_vec());
     }
 
     #[test]
-    fn test_fast_path_combined_sgr() {
-        // Combined SGR was previously re-encoded differently by Display.
-        // The fast path should now return the original bytes.
-        let mut filter = HistoryFilter::new();
-        let input = b"\x1b[1;31mBold Red\x1b[0m";
-        let output = filter.filter(input);
-        assert_eq!(
-            output,
-            input.to_vec(),
-            "fast path: combined SGR should return exact bytes"
-        );
-    }
-
-    #[test]
-    fn test_fast_path_cursor_with_defaults() {
-        let mut filter = HistoryFilter::new();
-        let input = b"\x1b[1;1H";
-        let output = filter.filter(input);
-        assert_eq!(
-            output,
-            input.to_vec(),
-            "fast path: cursor position should return exact bytes"
-        );
-    }
-
-    #[test]
-    fn test_slow_path_mixed_content() {
-        // When blacklisted content is present, the slow path is used.
-        // Verify it still works correctly.
+    fn test_mixed_content_strips_unsafe() {
         let mut filter = HistoryFilter::new();
         let input = b"Hello\x1b[?1004hWorld"; // focus tracking in middle
         let output = filter.filter(input);
         let text = String::from_utf8_lossy(&output);
-        assert!(text.contains("Hello"), "slow path should keep safe text");
-        assert!(text.contains("World"), "slow path should keep safe text");
+        assert!(text.contains("Hello"), "safe text should be kept");
+        assert!(text.contains("World"), "safe text should be kept");
         assert!(
             !text.contains("1004"),
-            "slow path should strip unsafe sequences"
-        );
-    }
-
-    #[test]
-    fn test_fast_path_returns_borrowed() {
-        let mut filter = HistoryFilter::new();
-        let input = b"plain text with \x1b[31mcolors\x1b[0m";
-        let output = filter.filter(input.as_slice());
-        assert!(
-            matches!(output, Cow::Borrowed(_)),
-            "fast path should return Cow::Borrowed, got Cow::Owned"
-        );
-    }
-
-    #[test]
-    fn test_slow_path_returns_owned() {
-        let mut filter = HistoryFilter::new();
-        let input = b"text\x1b[?1004hmore"; // contains blacklisted focus tracking
-        let output = filter.filter(input.as_slice());
-        assert!(
-            matches!(output, Cow::Owned(_)),
-            "slow path should return Cow::Owned, got Cow::Borrowed"
+            "unsafe sequences should be stripped"
         );
     }
 
@@ -880,16 +818,40 @@ mod tests {
         let out1 = filter.filter(chunk1);
         // The partial ESC won't produce a complete action, so the parser
         // buffers it. "Hello" should be in the output.
-        let s1 = String::from_utf8_lossy(out1.as_ref());
+        let s1 = String::from_utf8_lossy(&out1);
         assert!(s1.contains("Hello"), "chunk1 should contain text");
 
         // Chunk 2: completes the SGR sequence and adds more text
         let chunk2 = b"mBold\x1b[0m";
         let out2 = filter.filter(chunk2);
-        let s2 = String::from_utf8_lossy(out2.as_ref());
+        let s2 = String::from_utf8_lossy(&out2);
         assert!(
             s2.contains("Bold"),
             "chunk2 should contain continuation text"
+        );
+    }
+
+    #[test]
+    fn test_split_blacklisted_sequence_leaves_no_fragment() {
+        // Focus reporting (?1004h) split across reads: neither half may
+        // reach history, or replay sees a dangling escape that eats "world".
+        let mut filter = HistoryFilter::new();
+        let mut history = filter.filter(b"hello\x1b[?100").to_vec();
+        history.extend_from_slice(&filter.filter(b"4hworld"));
+        assert_eq!(history, b"helloworld".to_vec());
+    }
+
+    #[test]
+    fn test_split_safe_sequence_is_kept_whole() {
+        // SGR 31 split across reads, first after a blacklisted sequence: the
+        // completed sequence is in history once, not as literal "1m" text.
+        let mut filter = HistoryFilter::new();
+        let mut history = filter.filter(b"\x1b[?1004hA\x1b[3").to_vec();
+        history.extend_from_slice(&filter.filter(b"1mB"));
+        assert_eq!(
+            String::from_utf8_lossy(&history),
+            "A\x1b[31mB",
+            "the focus mode is dropped and SGR 31 kept whole"
         );
     }
 
@@ -898,9 +860,5 @@ mod tests {
         let mut filter = HistoryFilter::new();
         let output = filter.filter(b"");
         assert!(output.is_empty(), "empty input should produce empty output");
-        assert!(
-            matches!(output, Cow::Borrowed(_)),
-            "empty input should return Cow::Borrowed"
-        );
     }
 }
