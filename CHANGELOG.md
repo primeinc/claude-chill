@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows: a failed spawn left the console raw, and stdout's mode was never
   restored; both modes are restored on every exit path
 - Windows: a `CTRL_C_EVENT` sent to the proxy is forwarded to the child as 0x03
+- Windows: ConPTY input is written on its own thread through a bounded queue, so
+  a child that isn't reading can't stall output or deadlock the proxy, and piped
+  input back-pressures instead of buffering in memory
+- Windows: dropping the proxy stops its stdin reader and unregisters the console
+  control handler, so a host process that outlives it keeps its input and Ctrl+C
+- Windows: redirected stdin no longer skips VT processing on a console stdout
+- Windows: a failed `CreateProcessW` closes the pseudo-console and its pipes
+- Windows: the process attribute list is written through a mutable pointer
+- `--verbose` logs input byte counts, never the bytes typed
 - Leaving lookback or the alternate screen with no new child output left the
   history dump on screen; the live screen is rendered immediately
 - History could store half of an escape sequence split across reads (0.1.5's
