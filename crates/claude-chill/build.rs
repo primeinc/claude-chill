@@ -1,11 +1,12 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // Paths are relative to the workspace root (two levels up from crate root)
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/index");
 
     let git_hash = get_git_hash();
-    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
 }
 
 fn get_git_hash() -> String {
@@ -31,7 +32,7 @@ fn get_git_hash() -> String {
         .unwrap_or(false);
 
     if is_dirty {
-        format!("{}-dirty", hash)
+        format!("{hash}-dirty")
     } else {
         hash
     }

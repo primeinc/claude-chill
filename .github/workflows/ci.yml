@@ -26,10 +26,21 @@ jobs:
             exit 1
           fi
           echo "Version badge matches: $CARGO_VERSION"
+      - name: Check CHANGELOG has entry for current version
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if ! grep -q "\[$CARGO_VERSION\]" CHANGELOG.md; then
+            echo "CHANGELOG.md missing entry for version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "CHANGELOG has entry for: $CARGO_VERSION"
 
   check:
     name: Check
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,7 +58,10 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,7 +72,7 @@ jobs:
   test-matrix:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +91,7 @@ jobs:
           fi
 
   integration:
-    name: Integration Tests
+    name: Integration Tests (expect)
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -93,6 +107,24 @@ jobs:
         run: command -v expect || brew install expect
       - run: cargo build
       - run: expect tests/integration.exp
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Audit dependencies for known vulnerabilities
+        run: cargo audit
+
+  deny:
+    name: Supply Chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   nix-build:
     name: Nix Build

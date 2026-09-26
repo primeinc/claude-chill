@@ -24,6 +24,7 @@ impl Default for HistoryFilter {
 }
 
 impl HistoryFilter {
+    /// Create a new filter with a fresh termwiz parser.
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
@@ -31,17 +32,19 @@ impl HistoryFilter {
     }
 
     /// Filter bytes, returning only safe sequences for history.
+    ///
+    /// Always re-encodes the parsed actions. The parser holds back an escape
+    /// sequence split across calls until it completes, so passing input bytes
+    /// through verbatim would store the sequence's first half while its
+    /// completing half is classified (and possibly dropped) on the next call.
+    #[must_use]
     pub fn filter(&mut self, input: &[u8]) -> Vec<u8> {
-        let actions = self.parser.parse_as_vec(input);
-        let mut output = String::new();
-
-        for action in actions {
+        let mut output = String::with_capacity(input.len());
+        for action in self.parser.parse_as_vec(input) {
             if is_safe_for_history(&action) {
-                // Re-encode the action
-                let _ = write!(output, "{}", action);
+                let _ = write!(output, "{action}");
             }
         }
-
         output.into_bytes()
     }
 }
@@ -486,7 +489,7 @@ mod tests {
     fn test_plain_text_passes() {
         let mut filter = HistoryFilter::new();
         let output = filter.filter(b"Hello, World!");
-        assert_eq!(output, b"Hello, World!");
+        assert_eq!(output.as_slice(), b"Hello, World!");
     }
 
     #[test]
@@ -576,5 +579,286 @@ mod tests {
         let input = b"\x1b]10;?\x07";
         let output = filter.filter(input);
         assert!(output.is_empty(), "OSC query should be filtered");
+    }
+
+    // ====================================================================
+    // Round-trip fidelity tests: verify that the parse→classify→re-encode
+    // pipeline produces byte-equivalent output for common escape sequences.
+    // ====================================================================
+
+    /// Helper: assert that filtering produces byte-identical output.
+    fn assert_roundtrip_exact(input: &[u8], label: &str) {
+        let mut filter = HistoryFilter::new();
+        let output = filter.filter(input);
+        assert_eq!(
+            output, input,
+            "Round-trip fidelity failed for {label}: input={input:?} output={output:?}"
+        );
+    }
+
+    /// Helper: assert that filtering produces output that a VT100 parser
+    /// renders to the same screen contents as the input.
+    fn assert_roundtrip_visual(input: &[u8], label: &str) {
+        let mut filter = HistoryFilter::new();
+        let output = filter.filter(input);
+
+        let mut parser_in = vt100::Parser::new(24, 80, 0);
+        parser_in.process(input);
+        let mut parser_out = vt100::Parser::new(24, 80, 0);
+        parser_out.process(&output);
+
+        let screen_in = parser_in.screen().contents();
+        let screen_out = parser_out.screen().contents();
+        assert_eq!(screen_in, screen_out, "Visual fidelity failed for {label}");
+    }
+
+    #[test]
+    fn test_roundtrip_plain_text() {
+        assert_roundtrip_exact(b"Hello, World!", "plain text");
+    }
+
+    #[test]
+    fn test_roundtrip_newlines() {
+        assert_roundtrip_exact(b"line1\r\nline2\r\n", "CRLF text");
+    }
+
+    #[test]
+    fn test_roundtrip_clear_screen() {
+        assert_roundtrip_exact(b"\x1b[2J", "clear screen");
+    }
+
+    #[test]
+    fn test_reencoding_cursor_home() {
+        // termwiz re-encodes CUP with default params as \x1b[1;1H.
+        let mut filter = HistoryFilter::new();
+        assert_eq!(filter.filter(b"\x1b[H"), b"\x1b[1;1H".to_vec());
+        assert_roundtrip_visual(b"line one\r\nline two\x1b[HX", "cursor home then write");
+    }
+
+    #[test]
+    fn test_roundtrip_erase_line() {
+        assert_roundtrip_exact(b"\x1b[K", "erase to end of line");
+    }
+
+    #[test]
+    fn test_roundtrip_sgr_reset() {
+        assert_roundtrip_exact(b"\x1b[0m", "SGR reset");
+    }
+
+    #[test]
+    fn test_roundtrip_cursor_movement() {
+        // Cursor to specific position
+        assert_roundtrip_exact(b"\x1b[10;20H", "cursor position");
+    }
+
+    #[test]
+    fn test_roundtrip_cursor_up() {
+        assert_roundtrip_exact(b"\x1b[5A", "cursor up 5");
+    }
+
+    #[test]
+    fn test_roundtrip_scroll_up() {
+        assert_roundtrip_exact(b"\x1b[3S", "scroll up 3");
+    }
+
+    #[test]
+    fn test_roundtrip_insert_lines() {
+        assert_roundtrip_exact(b"\x1b[2L", "insert 2 lines");
+    }
+
+    #[test]
+    fn test_roundtrip_sgr_visual_fidelity() {
+        // SGR may re-encode (e.g., bold+red), so test visual equivalence
+        assert_roundtrip_visual(b"\x1b[1;31mBold Red\x1b[0m Normal", "bold red SGR");
+    }
+
+    #[test]
+    fn test_roundtrip_256_color_visual_fidelity() {
+        assert_roundtrip_visual(b"\x1b[38;5;196mRed256\x1b[0m", "256-color SGR");
+    }
+
+    #[test]
+    fn test_roundtrip_truecolor_visual_fidelity() {
+        assert_roundtrip_visual(b"\x1b[38;2;255;128;0mOrange\x1b[0m", "truecolor SGR");
+    }
+
+    #[test]
+    fn test_roundtrip_mixed_visual_fidelity() {
+        // A realistic Claude Code output snippet: cursor positioning + SGR + text
+        let input = b"\x1b[H\x1b[2J\x1b[1;1H\x1b[1;34mFile:\x1b[0m src/main.rs\r\n\x1b[32m+ added line\x1b[0m\r\n";
+        assert_roundtrip_visual(input, "mixed Claude-like output");
+    }
+
+    #[test]
+    fn test_roundtrip_dec_line_drawing() {
+        // DEC special graphics mode (box drawing)
+        assert_roundtrip_exact(b"\x1b(0", "DEC line drawing G0");
+        assert_roundtrip_exact(b"\x1b(B", "ASCII charset G0");
+    }
+
+    #[test]
+    fn test_roundtrip_save_restore_cursor() {
+        assert_roundtrip_exact(b"\x1b7", "save cursor");
+        assert_roundtrip_exact(b"\x1b8", "restore cursor");
+    }
+
+    #[test]
+    fn test_roundtrip_tab_and_newline() {
+        assert_roundtrip_exact(b"\t", "tab");
+        assert_roundtrip_exact(b"\n", "newline");
+        assert_roundtrip_exact(b"\r", "carriage return");
+    }
+
+    // ====================================================================
+    // Known re-encoding divergences: termwiz Display may emit bytes that
+    // differ from the original input. These tests document the divergences
+    // and verify visual equivalence despite byte-level differences.
+    // ====================================================================
+
+    #[test]
+    fn test_reencoding_sgr_combined_params() {
+        // \x1b[1;31m (bold + red) — termwiz may split into separate SGR sequences
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[1;31mtext\x1b[0m";
+        let output = filter.filter(input);
+
+        // Verify visual equivalence even if bytes differ
+        let mut p_in = vt100::Parser::new(24, 80, 0);
+        p_in.process(input);
+        let mut p_out = vt100::Parser::new(24, 80, 0);
+        p_out.process(&output);
+        assert_eq!(
+            p_in.screen().contents(),
+            p_out.screen().contents(),
+            "combined SGR must be visually equivalent"
+        );
+
+        // Document whether this particular case round-trips exactly
+        if output != input.to_vec() {
+            // Known divergence: termwiz may re-encode combined SGR differently.
+            // This is acceptable as long as visual output is identical.
+        }
+    }
+
+    #[test]
+    fn test_reencoding_cursor_default_params() {
+        // \x1b[1;1H — termwiz may normalize to \x1b[H (default params elided)
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[1;1H";
+        let output = filter.filter(input);
+
+        let mut p_in = vt100::Parser::new(24, 80, 0);
+        p_in.process(input);
+        let mut p_out = vt100::Parser::new(24, 80, 0);
+        p_out.process(&output);
+        assert_eq!(
+            p_in.screen().cursor_position(),
+            p_out.screen().cursor_position(),
+            "cursor position must match"
+        );
+    }
+
+    #[test]
+    fn test_reencoding_sgr_reset() {
+        // \x1b[0m — termwiz may re-encode as \x1b[m (eliding the 0)
+        let mut filter = HistoryFilter::new();
+        let input = b"\x1b[0m";
+        let output = filter.filter(input);
+
+        // Both forms are visually identical
+        let mut p_in = vt100::Parser::new(24, 80, 0);
+        p_in.process(b"\x1b[1;31mRed\x1b[0m Normal");
+        let mut p_out = vt100::Parser::new(24, 80, 0);
+        p_out.process(b"\x1b[1;31mRed");
+        p_out.process(&output);
+        p_out.process(b" Normal");
+        // Both should have "Normal" without attributes
+        assert_eq!(
+            p_in.screen().contents(),
+            p_out.screen().contents(),
+            "SGR reset must produce same visual result"
+        );
+    }
+
+    // ====================================================================
+    // Re-encoding and chunk-boundary tests
+    // ====================================================================
+
+    #[test]
+    fn test_plain_text_round_trips() {
+        let mut filter = HistoryFilter::new();
+        let input = b"Hello, World!";
+        let output = filter.filter(input);
+        assert_eq!(output, input.to_vec());
+    }
+
+    #[test]
+    fn test_mixed_content_strips_unsafe() {
+        let mut filter = HistoryFilter::new();
+        let input = b"Hello\x1b[?1004hWorld"; // focus tracking in middle
+        let output = filter.filter(input);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("Hello"), "safe text should be kept");
+        assert!(text.contains("World"), "safe text should be kept");
+        assert!(
+            !text.contains("1004"),
+            "unsafe sequences should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_stateful_parser_across_chunks() {
+        // Verify that the filter handles escape sequences split across calls.
+        // The parser is stateful, so a partial ESC in one call should be
+        // completed in the next call.
+        let mut filter = HistoryFilter::new();
+
+        // Chunk 1: text ending with partial ESC sequence (SGR bold)
+        let chunk1 = b"Hello\x1b[1";
+        let out1 = filter.filter(chunk1);
+        // The partial ESC won't produce a complete action, so the parser
+        // buffers it. "Hello" should be in the output.
+        let s1 = String::from_utf8_lossy(&out1);
+        assert!(s1.contains("Hello"), "chunk1 should contain text");
+
+        // Chunk 2: completes the SGR sequence and adds more text
+        let chunk2 = b"mBold\x1b[0m";
+        let out2 = filter.filter(chunk2);
+        let s2 = String::from_utf8_lossy(&out2);
+        assert!(
+            s2.contains("Bold"),
+            "chunk2 should contain continuation text"
+        );
+    }
+
+    #[test]
+    fn test_split_blacklisted_sequence_leaves_no_fragment() {
+        // Focus reporting (?1004h) split across reads: neither half may
+        // reach history, or replay sees a dangling escape that eats "world".
+        let mut filter = HistoryFilter::new();
+        let mut history = filter.filter(b"hello\x1b[?100").to_vec();
+        history.extend_from_slice(&filter.filter(b"4hworld"));
+        assert_eq!(history, b"helloworld".to_vec());
+    }
+
+    #[test]
+    fn test_split_safe_sequence_is_kept_whole() {
+        // SGR 31 split across reads, first after a blacklisted sequence: the
+        // completed sequence is in history once, not as literal "1m" text.
+        let mut filter = HistoryFilter::new();
+        let mut history = filter.filter(b"\x1b[?1004hA\x1b[3").to_vec();
+        history.extend_from_slice(&filter.filter(b"1mB"));
+        assert_eq!(
+            String::from_utf8_lossy(&history),
+            "A\x1b[31mB",
+            "the focus mode is dropped and SGR 31 kept whole"
+        );
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let mut filter = HistoryFilter::new();
+        let output = filter.filter(b"");
+        assert!(output.is_empty(), "empty input should produce empty output");
     }
 }
