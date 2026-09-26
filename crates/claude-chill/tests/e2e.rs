@@ -166,9 +166,10 @@ fn test_e2e_large_output() {
         "seq 1 100 | while read i; do echo Line number $i; done"
     };
     let (stdout, code) = run_proxy_with_command(cmd);
-    // ConPTY re-renders the child's screen, so on Windows the stream holds
-    // cursor-addressed screen updates, not the child's bytes: check what a
-    // 24x80 terminal (the proxy's fallback size) shows at the end.
+    // The proxy renders the child's screen through its VT emulator (and on
+    // Windows ConPTY renders it first), so the stream is screen updates, not
+    // the child's bytes: check what a 24x80 terminal (the proxy's fallback
+    // size) shows at the end. Earlier lines have scrolled off that screen.
     let mut screen = vt100::Parser::new(24, 80, 0);
     screen.process(stdout.as_bytes());
     let shown = screen.screen().contents();
@@ -176,12 +177,10 @@ fn test_e2e_large_output() {
         shown.contains("Line number 100"),
         "Missing last line on the final screen:\n{shown}\nStream:\n{stdout}"
     );
-    if !cfg!(windows) {
-        assert!(
-            stdout.contains("Line number 1\r\n") || stdout.contains("Line number 1\n"),
-            "Missing first line in:\n{stdout}"
-        );
-    }
+    assert!(
+        shown.contains("Line number 99\n"),
+        "Missing the line before it on the final screen:\n{shown}"
+    );
     assert_eq!(code, Some(0));
 }
 
