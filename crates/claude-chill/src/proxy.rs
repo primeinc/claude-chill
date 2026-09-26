@@ -35,6 +35,33 @@ use std::process::{Child, Command};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+/// Holds the saved termios from raw-mode setup until `Proxy` owns it, so an
+/// error anywhere in `spawn` (e.g. a command that does not exist) restores
+/// the user's terminal instead of leaving it raw.
+struct TerminalGuard {
+    original_termios: Option<Termios>,
+}
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            original_termios: setup_raw_mode()?,
+        })
+    }
+
+    fn take(mut self) -> Option<Termios> {
+        self.original_termios.take()
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Some(ref termios) = self.original_termios {
+            terminal::restore_termios(termios);
+        }
+    }
+}
+
 /// PTY proxy that sits between a terminal and a child process, providing
 /// VT-based differential rendering and scrollback history.
 pub struct Proxy {
@@ -93,7 +120,7 @@ impl Proxy {
         let winsize = get_terminal_size()?;
         let pty = openpty(&winsize, None).context("openpty failed")?;
 
-        let original_termios = setup_raw_mode()?;
+        let terminal_guard = TerminalGuard::new()?;
         setup_signal_handlers()?;
 
         // Detect Kitty support before spawning child
@@ -150,7 +177,7 @@ impl Proxy {
             config,
             pty_master: pty.master,
             child,
-            original_termios,
+            original_termios: terminal_guard.take(),
             renderer,
             last_stdin_time: None,
             last_auto_lookback_time: None,

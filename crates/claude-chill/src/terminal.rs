@@ -125,7 +125,8 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// Restore terminal settings. Called from `Proxy::drop`.
+/// Restore terminal settings. Called from `Proxy::drop` and, when `spawn`
+/// fails before `Proxy` exists, from `TerminalGuard::drop`.
 pub fn restore_termios(termios: &Termios) {
     let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
 }
