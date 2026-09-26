@@ -16,14 +16,18 @@ use crate::proxy_common::should_auto_lookback;
 use crate::sequence_match::{self, SequenceMatch};
 use crate::sync_block::SyncBlockParser;
 use crate::terminal_windows::{
-    ConsoleMode, SIGINT_RECEIVED, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, TerminalSize,
+    ConsoleMode, CtrlHandler, SIGINT_RECEIVED, SIGTERM_RECEIVED, SIGWINCH_RECEIVED, TerminalSize,
     get_terminal_size, setup_raw_mode, setup_signal_handlers,
 };
 use crate::vt_renderer::VtRenderer;
 use anyhow::{Context, Result};
-use log::debug;
+use log::{debug, warn};
+use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::atomic::Ordering;
+use std::os::windows::io::AsRawHandle;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::TrySendError;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK, WAIT_OBJECT_0,
@@ -33,6 +37,7 @@ use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, HPCON, ResizePseudoConsole,
     STD_INPUT_HANDLE,
 };
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -50,11 +55,19 @@ pub struct Proxy {
     child_thread: HANDLE,
     pipe_input_write: HANDLE, // Write end: our input → child's stdin
     pipe_output_read: HANDLE, // Read end: child's stdout → our output
-    // Queue to the thread that writes pipe_input_write; set by run().
-    pty_input_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    // Bounded queue to the thread that writes pipe_input_write; set by run().
+    pty_input_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    // Input that did not fit in that queue yet. stdin is not read while this
+    // holds anything, so back-pressure reaches the stdin reader and its pipe.
+    pty_pending: VecDeque<Vec<u8>>,
     pty_writer: Option<std::thread::JoinHandle<()>>,
-    // Held for its Drop, which restores the console modes.
+    // stdin reader thread and its stop flag; Drop cancels its blocked read.
+    stdin_reader: Option<std::thread::JoinHandle<()>>,
+    stdin_stop: Arc<AtomicBool>,
+    // Held for their Drops: restore the console modes, unregister the
+    // console control handler.
     _console_mode: ConsoleMode,
+    _ctrl_handler: CtrlHandler,
 
     // VT rendering
     renderer: VtRenderer,
@@ -104,7 +117,7 @@ impl Proxy {
         let winsize = get_terminal_size()?;
 
         let original_console_mode = setup_raw_mode()?;
-        setup_signal_handlers()?;
+        let ctrl_handler = setup_signal_handlers()?;
 
         // Kitty detection: Windows terminals generally don't support Kitty protocol
         let kitty_tracker = kitty_tracker::KittyTracker::new(false, 0);
@@ -208,6 +221,7 @@ impl Proxy {
             pipe_input_write,
             pipe_output_read,
             _console_mode: original_console_mode,
+            _ctrl_handler: ctrl_handler,
             renderer,
             last_stdin_time: None,
             last_auto_lookback_time: None,
@@ -221,7 +235,10 @@ impl Proxy {
             output_buffer: Vec::with_capacity(crate::escape_sequences::OUTPUT_BUFFER_CAPACITY),
             last_terminal_size: winsize,
             pty_input_tx: None,
+            pty_pending: VecDeque::new(),
             pty_writer: None,
+            stdin_reader: None,
+            stdin_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -278,17 +295,17 @@ impl Proxy {
         // waits for key input (resize and focus records do not complete it),
         // so on the event loop it stalls output. A redirected stdin (pipe,
         // file, NUL) is not a console, and only ReadFile drains it and sees
-        // its EOF. The thread ends at EOF or on a read error; it is never
-        // joined, because a console read cannot be cancelled and process exit
-        // ends it.
+        // its EOF. The thread ends at EOF, on a read error, or when Drop sets
+        // stdin_stop and cancels its blocked read.
         // SAFETY: GetStdHandle returns this process's stdin handle, valid for
         // the life of the process. Transferred as usize like the output pipe.
         let stdin_handle_raw = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
         let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
-        std::thread::spawn(move || {
+        let stdin_stop = Arc::clone(&self.stdin_stop);
+        self.stdin_reader = Some(std::thread::spawn(move || {
             let stdin_handle = stdin_handle_raw as HANDLE;
             let mut read_buf = vec![0u8; 4096];
-            loop {
+            while !stdin_stop.load(Ordering::SeqCst) {
                 let mut bytes_read: u32 = 0;
                 // SAFETY: stdin_handle is the process stdin handle; read_buf is
                 // valid for its length; bytes_read receives the count.
@@ -302,7 +319,7 @@ impl Proxy {
                     )
                 };
                 if ok == 0 || bytes_read == 0 {
-                    break; // EOF, closed pipe, or no usable stdin
+                    break; // EOF, closed pipe, cancelled, or no usable stdin
                 }
                 if input_tx
                     .send(read_buf[..bytes_read as usize].to_vec())
@@ -311,16 +328,17 @@ impl Proxy {
                     break; // Main thread dropped the receiver
                 }
             }
-        });
+        }));
 
         // ConPTY input is written on its own thread as well. WriteFile blocks
         // while the child is not reading its input; on the event loop that
         // stops output draining, and with the bounded output channel a child
         // blocked writing output and a proxy blocked writing input deadlock.
-        // The queue holds what arrived on stdin plus what the proxy generates
-        // (lookback keys, Ctrl+C). Drop joins this thread.
+        // The queue is bounded too: when it is full, input waits in
+        // pty_pending and stdin is not read (see the event loop). Drop joins
+        // this thread.
         let pipe_input_raw = self.pipe_input_write as usize;
-        let (pty_input_tx, pty_input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (pty_input_tx, pty_input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
         self.pty_input_tx = Some(pty_input_tx);
         self.pty_writer = Some(std::thread::spawn(move || {
             let pipe_input_write = pipe_input_raw as HANDLE;
@@ -387,8 +405,13 @@ impl Proxy {
                 got_output = true;
             }
 
-            // Forward stdin read by the input thread (non-blocking)
-            while let Ok(data) = input_rx.try_recv() {
+            // Forward stdin read by the input thread (non-blocking). While
+            // input still waits for the writer, stdin stays in its bounded
+            // channel, so the reader thread and the pipe behind it wait
+            // instead of this process buffering an input file.
+            self.flush_pty_pending();
+            while self.pty_pending.is_empty() {
+                let Ok(data) = input_rx.try_recv() else { break };
                 self.process_input(&data, &mut stdout)?;
             }
 
@@ -542,16 +565,35 @@ impl Proxy {
         Ok(())
     }
 
-    /// Queue bytes for the ConPTY input writer thread. A send only fails once
-    /// the writer has stopped on a broken pipe (the child or ConPTY is gone),
-    /// and the event loop then ends on child exit.
-    fn write_to_pty(&self, data: &[u8]) -> Result<()> {
-        if let Some(tx) = &self.pty_input_tx
-            && tx.send(data.to_vec()).is_err()
-        {
-            debug!("write_to_pty: writer stopped, dropped {} bytes", data.len());
-        }
+    /// Queue bytes for the ConPTY input writer thread, in order.
+    fn write_to_pty(&mut self, data: &[u8]) -> Result<()> {
+        self.pty_pending.push_back(data.to_vec());
+        self.flush_pty_pending();
         Ok(())
+    }
+
+    /// Move pending input into the writer's bounded queue until it is full.
+    /// The queue disconnects only once the writer has stopped on a broken
+    /// pipe (the child or ConPTY is gone); the event loop then ends on child
+    /// exit, so pending input is dropped.
+    fn flush_pty_pending(&mut self) {
+        let Some(tx) = &self.pty_input_tx else {
+            return;
+        };
+        while let Some(data) = self.pty_pending.pop_front() {
+            match tx.try_send(data) {
+                Ok(()) => {}
+                Err(TrySendError::Full(data)) => {
+                    self.pty_pending.push_front(data);
+                    break;
+                }
+                Err(TrySendError::Disconnected(data)) => {
+                    debug!("write_to_pty: writer stopped, dropped {} bytes", data.len());
+                    self.pty_pending.clear();
+                    break;
+                }
+            }
+        }
     }
 
     fn process_input(&mut self, data: &[u8], stdout: &mut io::Stdout) -> Result<()> {
@@ -734,6 +776,33 @@ impl Proxy {
 
 impl Drop for Proxy {
     fn drop(&mut self) {
+        // Stop the stdin reader so a host process that outlives the proxy
+        // does not lose its next input to it. Set the flag, then cancel its
+        // blocked ReadFile and wait on the thread handle for it to exit. A
+        // cancel that lands between reads is lost, so cancel again on each
+        // attempt; after 200 attempts (~200 ms) it is left detached, loudly.
+        self.stdin_stop.store(true, Ordering::SeqCst);
+        if let Some(reader) = self.stdin_reader.take() {
+            let thread = reader.as_raw_handle() as HANDLE;
+            let mut stopped = false;
+            for _ in 0..200 {
+                // SAFETY: thread is the reader's handle, valid while `reader`
+                // is held; cancelling its synchronous I/O only fails that read.
+                unsafe { CancelSynchronousIo(thread) };
+                // SAFETY: as above; waiting on the handle observes the exit.
+                if unsafe { WaitForSingleObject(thread, 1) } == WAIT_OBJECT_0 {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                let _ = reader.join();
+                debug!("stdin reader stopped");
+            } else {
+                warn!("stdin reader did not stop after 200 cancel attempts; left detached");
+            }
+        }
+
         // SAFETY: conpty is a valid HPCON unless run() already closed it and
         // set it to 0.
         unsafe {

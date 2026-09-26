@@ -126,8 +126,20 @@ pub fn setup_raw_mode() -> Result<ConsoleMode> {
     Ok(saved)
 }
 
+/// Installed Ctrl+C / Ctrl+Break handler; dropping it unregisters the
+/// handler, so a host process that outlives the proxy gets its console
+/// control events back.
+pub struct CtrlHandler(());
+
+impl Drop for CtrlHandler {
+    fn drop(&mut self) {
+        // SAFETY: removes the callback registered in setup_signal_handlers.
+        unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), FALSE) };
+    }
+}
+
 /// Install Ctrl+C / Ctrl+Break handler.
-pub fn setup_signal_handlers() -> Result<()> {
+pub fn setup_signal_handlers() -> Result<CtrlHandler> {
     // SAFETY: ctrl_handler is a valid extern "system" callback that only
     // performs atomic stores, which are safe from any thread context.
     if unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), TRUE) } == 0 {
@@ -136,7 +148,7 @@ pub fn setup_signal_handlers() -> Result<()> {
             io::Error::last_os_error()
         );
     }
-    Ok(())
+    Ok(CtrlHandler(()))
 }
 
 /// No-op on Windows — handles don't use fcntl-style non-blocking.
