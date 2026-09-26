@@ -99,7 +99,18 @@ impl VtRenderer {
         if !self.vt_render_pending {
             return None;
         }
+        Some(self.render_now())
+    }
 
+    /// Render the whole screen now, pending or not. Restores the live screen
+    /// after lookback or alternate-screen exit, when no new output may follow.
+    #[must_use]
+    pub fn render_full(&mut self) -> &[u8] {
+        self.force_full_render();
+        self.render_now()
+    }
+
+    fn render_now(&mut self) -> &[u8] {
         let is_diff = self.vt_prev_screen.is_some();
         self.output_buffer.clear();
         self.output_buffer.extend_from_slice(SYNC_START);
@@ -129,7 +140,7 @@ impl VtRenderer {
         self.vt_render_pending = false;
         self.last_render_time = Some(Instant::now());
 
-        Some(&self.output_buffer)
+        &self.output_buffer
     }
 
     /// Render only if the delay has elapsed. Returns bytes to write, or `None`.
@@ -346,6 +357,35 @@ mod tests {
         assert!(output.is_some());
         // After force_full_render, should produce a full render, not just a diff
         // (we can't easily distinguish, but we verify it doesn't crash)
+    }
+
+    #[test]
+    fn test_render_full_without_pending_output() {
+        // Lookback exit: the screen was rendered, then lookback cancelled the
+        // pending state, and no new output arrived. The live screen must still
+        // be written back.
+        let mut renderer = VtRenderer::new(24, 80);
+        renderer.process(b"LIVE_SCREEN");
+        renderer.mark_pending();
+        let _ = renderer.render();
+        renderer.cancel_pending();
+
+        renderer.force_full_render();
+        assert!(
+            renderer.render().is_none(),
+            "render() stays gated on pending"
+        );
+
+        let bytes = renderer.render_full().to_vec();
+        assert!(bytes.starts_with(SYNC_START));
+        assert!(bytes.ends_with(SYNC_END));
+        assert!(
+            bytes
+                .windows(b"LIVE_SCREEN".len())
+                .any(|w| w == b"LIVE_SCREEN"),
+            "full render should rewrite the screen contents"
+        );
+        assert!(!renderer.is_pending());
     }
 
     #[test]

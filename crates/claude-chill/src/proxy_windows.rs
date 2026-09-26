@@ -328,12 +328,12 @@ impl Proxy {
         }
 
         // Final render
-        if self.renderer.is_pending() {
-            if let Some(bytes) = self.renderer.render() {
-                self.kitty_tracker.process(bytes);
-                stdout.write_all(bytes)?;
-                stdout.flush()?;
-            }
+        if self.renderer.is_pending()
+            && let Some(bytes) = self.renderer.render()
+        {
+            self.kitty_tracker.process(bytes);
+            stdout.write_all(bytes)?;
+            stdout.flush()?;
         }
 
         self.wait_child()
@@ -439,12 +439,10 @@ impl Proxy {
             self.write_stdout(stdout, &data[exit_pos..exit_pos + seq_len])?;
             self.alt_screen.set_alternate_screen(false);
 
-            self.renderer.force_full_render();
-            if let Some(bytes) = self.renderer.render() {
-                self.kitty_tracker.process(bytes);
-                stdout.write_all(bytes).context("write to stdout")?;
-                stdout.flush()?;
-            }
+            let bytes = self.renderer.render_full();
+            self.kitty_tracker.process(bytes);
+            stdout.write_all(bytes).context("write to stdout")?;
+            stdout.flush()?;
 
             let remaining = &data[exit_pos + seq_len..];
             if !remaining.is_empty() && self.alt_screen.find_enter(remaining).is_some() {
@@ -595,38 +593,35 @@ impl Proxy {
         self.sync_parser.reset();
         self.check_resize()?;
 
-        self.renderer.force_full_render();
-        if let Some(bytes) = self.renderer.render() {
-            self.kitty_tracker.process(bytes);
-            stdout.write_all(bytes).context("write to stdout")?;
-            stdout.flush()?;
-        }
+        let bytes = self.renderer.render_full();
+        self.kitty_tracker.process(bytes);
+        stdout.write_all(bytes).context("write to stdout")?;
+        stdout.flush()?;
 
         Ok(())
     }
 
     fn check_resize(&mut self) -> Result<()> {
-        if let Ok(winsize) = get_terminal_size() {
-            if winsize.ws_row != self.last_terminal_size.ws_row
-                || winsize.ws_col != self.last_terminal_size.ws_col
-            {
-                debug!(
-                    "check_resize: rows={} cols={}",
-                    winsize.ws_row, winsize.ws_col
-                );
-                self.last_terminal_size = winsize;
-                self.renderer.resize(winsize.ws_row, winsize.ws_col);
-                let size = COORD {
-                    X: winsize.ws_col as i16,
-                    Y: winsize.ws_row as i16,
-                };
-                // SAFETY: conpty is a valid HPCON, size is a valid COORD.
-                let hr = unsafe { ResizePseudoConsole(self.conpty, size) };
-                if hr != S_OK {
-                    debug!("ResizePseudoConsole failed: HRESULT 0x{hr:08x}");
-                }
-                SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
+        if let Ok(winsize) = get_terminal_size()
+            && (winsize.ws_row != self.last_terminal_size.ws_row
+                || winsize.ws_col != self.last_terminal_size.ws_col)
+        {
+            debug!(
+                "check_resize: rows={} cols={}",
+                winsize.ws_row, winsize.ws_col
+            );
+            self.last_terminal_size = winsize;
+            self.renderer.resize(winsize.ws_row, winsize.ws_col);
+            let size = COORD {
+                X: winsize.ws_col as i16,
+                Y: winsize.ws_row as i16,
+            };
+            // SAFETY: conpty is a valid HPCON, size is a valid COORD.
+            let hr = unsafe { ResizePseudoConsole(self.conpty, size) };
+            if hr != S_OK {
+                debug!("ResizePseudoConsole failed: HRESULT 0x{hr:08x}");
             }
+            SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
         }
         Ok(())
     }

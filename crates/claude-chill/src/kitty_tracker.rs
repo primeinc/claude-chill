@@ -100,10 +100,10 @@ pub fn should_skip_kitty_query(term_program: Option<&str>, term: Option<&str>) -
         }
     }
 
-    if let Some(t) = term {
-        if matches!(t, "dumb" | "linux" | "vt100" | "vt220") {
-            return true;
-        }
+    if let Some(t) = term
+        && matches!(t, "dumb" | "linux" | "vt100" | "vt220")
+    {
+        return true;
     }
 
     false

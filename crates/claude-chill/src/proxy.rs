@@ -340,8 +340,7 @@ impl Proxy {
 
             // Force full VT render to restore main screen content
             debug!("process_output_alt_screen: rendering VT screen after alt exit");
-            self.renderer.force_full_render();
-            self.render_vt_screen(stdout_fd)?;
+            self.render_vt_screen_full(stdout_fd)?;
 
             // Data after ALT_EXIT was already fed to VT and history when we processed
             // the alt screen chunk, so we just need to check for more alt screen transitions
@@ -399,6 +398,11 @@ impl Proxy {
             write_to_terminal(&mut self.kitty_tracker, stdout_fd, bytes)?;
         }
         Ok(())
+    }
+
+    fn render_vt_screen_full<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        let bytes = self.renderer.render_full();
+        write_to_terminal(&mut self.kitty_tracker, stdout_fd, bytes)
     }
 
     fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
@@ -588,8 +592,7 @@ impl Proxy {
 
         // Force full render since terminal was showing history
         debug!("exit_lookback_mode: rendering VT screen");
-        self.renderer.force_full_render();
-        self.render_vt_screen(stdout_fd)?;
+        self.render_vt_screen_full(stdout_fd)?;
 
         Ok(())
     }

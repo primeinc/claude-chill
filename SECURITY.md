@@ -3,7 +3,7 @@
 ## Reporting Vulnerabilities
 
 If you discover a security vulnerability, please report it responsibly via
-[GitHub Security Advisories](https://github.com/davidbeesley/claude-chill/security/advisories/new)
+[GitHub Security Advisories](https://github.com/primeinc/claude-chill/security/advisories/new)
 rather than opening a public issue.
 
 Include:
